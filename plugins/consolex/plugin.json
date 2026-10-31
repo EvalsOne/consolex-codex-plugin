@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "consolex",
+  "version": "1.2.1",
+  "description": "Run ConsoleX tasks in Codex and check deliveries in ConsoleX.",
+  "author": {
+    "name": "ConsoleX"
+  },
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json",
+      "interface": {
+        "displayName": "ConsoleX",
+        "shortDescription": "ConsoleX task delivery checks"
+      }
+    }
+  }
+}
