@@ -9,21 +9,32 @@ Connect once per computer: `/consolex:login` starts a device-code sign-in, opens
 and a background poller saves the device token to `~/.consolex/credentials.json` (0600) once the
 owner approves. That file is shared by every coding-agent integration on the computer.
 
-Commands (handled here, from the prompt): `/consolex:login [api]`, `/consolex:logout`,
-`/consolex:tasks [words]`, `/consolex:add [words | ConsoleX link]`, `/consolex:check [off]`,
-`/consolex:save [task name]` (this session becomes a task draft the owner reviews in ConsoleX).
+Commands (handled here, from the prompt): `/consolex:login [api]`, `/consolex:logout`, `/consolex:status`,
+`/consolex:tasks [words]`, `/consolex:add [words | ConsoleX link]`, `/consolex:remove <task>` (take an added task
+off this computer), `/consolex:start <task> [-- request]`
+(do a task in this session without adding it), `/consolex:check [off]`, `/consolex:run <task>` (an isolated run),
+`/consolex:save [task name]` (this session becomes a task draft the owner reviews in ConsoleX),
+`/consolex:schedule <task> [-- when, and where things are]` (a Claude desktop scheduled task that runs an added
+task; its prompt is a fixed shell, so everything about the work stays in the ConsoleX method).
 
 Flow for a task (docs/claude-code-checks.md in the ConsoleX service repo):
 - Its Skill loads -> mark this session, fetch the Task's latest approved method, add it to context.
 - Claude ends a turn with a "ConsoleX delivery" section -> submit the deliverable; ConsoleX checks
   it against the Task's saved standard and records the attempt. Not passed -> Claude reports the
-  result and asks the owner; it revises only after the owner says so (never automatically).
+  result and asks the owner; it revises only after the owner says so. One exception the owner opts
+  into per task (`on_failure: fix_rules`): failed rule checks go back to Claude to fix, at most
+  MAX_AGENT_FIXES times; AI-judged checks are only ever reported.
+- Unattended runs (a Claude desktop scheduled task, `consolex run --headless`, or CONSOLEX_UNATTENDED=1):
+  nobody can answer, so Claude never asks (AskUserQuestion is denied) and never waits; it writes the
+  result down and the turn ends. The run record and the run email carry the result.
 - The acceptance standard never reaches this computer: Claude sees the method, and after a check
   only the items that did not pass. An agent that sees how it is judged writes to the checks.
 
 Standard library only (macOS ships Python 3.9). Tasks are named by UUID and name, never by id.
 """
 import base64
+import glob
+import hashlib
 import json
 import os
 import re
@@ -32,6 +43,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,11 +71,30 @@ TEXT_SUFFIXES = {'.md', '.markdown', '.txt', '.json', '.csv', '.tsv', '.html', '
 MAX_FILE_BYTES = 200_000
 MAX_TOTAL_CHARS = 400_000
 MARKER_TTL_SECONDS = 7 * 24 * 3600
+MAX_WORK_SECONDS = 24 * 3600  # longer than this is not one delivery's work: its duration is not sent
 SUBMIT_TIMEOUT = 170
 QUICK_TIMEOUT = 8
 TRANSCRIPT_TAIL_BYTES = 4_000_000
 HEARTBEAT_SECONDS = 120  # at most one "still working" signal per this many seconds
+MAX_AGENT_FIXES = 2  # rounds a coding agent fixes failed rule checks on its own, when the task allows it
+# How the Claude desktop app opens the prompt of a scheduled task's run.
+SCHEDULED_PROMPT = re.compile(r'\s*<scheduled-task[\s>]')
+# How the Codex app opens the prompt of a scheduled task's run (2026-11): the automation's name, id, memory file and
+# last run, one per line, then a blank line and the saved prompt.
+CODEX_AUTOMATION_PROMPT = re.compile(
+    r'\s*Automation: [^\n]*\nAutomation ID: ([A-Za-z0-9._-]{1,128})[ \t]*\n(?:[A-Za-z][A-Za-z ]{0,40}:[^\n]*\n)*[ \t]*\n')
 SESSION_TIMEOUT = 4
+
+
+def codex_automation(prompt):
+    """(automation id, the saved prompt) when `prompt` is a Codex app scheduled run's, else (None, prompt)."""
+    match = CODEX_AUTOMATION_PROMPT.match(prompt or '')
+    return (match.group(1), prompt[match.end():]) if match else (None, prompt)
+
+
+def scheduled_prompt(prompt):
+    """True when a desktop app's scheduler, not a person, wrote this prompt (Claude desktop or the Codex app)."""
+    return bool(SCHEDULED_PROMPT.match(prompt or '') or CODEX_AUTOMATION_PROMPT.match(prompt or ''))
 
 DELIVERY_HEADING = re.compile(r'^\s{0,3}#{1,4}\s*ConsoleX\s*(?:交付|delivery)\s*$', re.IGNORECASE | re.MULTILINE)
 CONFIRM_HEADING = re.compile(r'^\s{0,3}#{1,4}\s*(?:待你确认|待您确认|Needs your confirmation)\s*$', re.IGNORECASE | re.MULTILINE)
@@ -412,7 +443,7 @@ def on_login(data, env, argument, http=http_json, spawn=_spawn_poller):
         'The code expires in 10 minutes. %s Tell the user exactly this in two short lines; do not run any commands.') % (
         api_base, 'The browser was opened.' if opened else 'Open this link in a browser.', body['user_code'],
         body['verification_uri_complete'],
-        'ConsoleX saves the connection automatically once approved; afterwards /consolex:tasks lists the tasks.'
+        'ConsoleX saves the connection automatically once approved; afterwards /consolex:add with no words lists the tasks.'
         if polling else 'After approving, run /consolex:login again to finish.'))
 
 
@@ -430,6 +461,59 @@ def on_logout(data, env, argument, http=http_json):
 def _not_connected(data, api_base):
     return _context(data, 'ConsoleX is not connected on this computer (%s). Tell the user to run /consolex:login '
                           'first. Do not run anything else.' % api_base)
+
+
+def _client_version():
+    """The version of this installed client (Claude Code and Codex plugin.json, the DSH package.json), or ''."""
+    for name in ('.claude-plugin/plugin.json', 'plugin.json', 'package.json'):
+        data = _read_json(os.path.join(plugin_root(), name), None)
+        if isinstance(data, dict) and data.get('version'):
+            return str(data['version'])
+    return ''
+
+
+def on_status(data, env, argument, http=http_json):
+    """`/consolex:status`: whether this computer is connected (asked of ConsoleX, not only read from the file), as
+    whom, whether it may use the tasks' tools and files, and which installed tasks cannot be checked from here."""
+    api_base = default_api_base(env)
+    token, connection = connection_for(env, api_base)
+    lines = []
+    version = _client_version()
+    if version:
+        lines.append('ConsoleX plugin version: %s' % version)
+    if not token:
+        lines.append('Connection: not connected (%s). Run /consolex:login to connect.' % api_base)
+    else:
+        status, body = http('GET', api_base + '/api/operator/external/device', token, timeout=QUICK_TIMEOUT)
+        account = (body.get('account') or {}).get('email') or connection.get('account') or 'unknown account'
+        if status == 200 and body.get('succ'):
+            device = body.get('device') or {}
+            lines.append('Connection: connected to %s as %s, device "%s".' % (
+                api_base, account, device.get('name') or connection.get('device') or 'this computer'))
+            lines.append("Tasks' tools and files: %s" % (
+                'allowed' if device.get('task_capabilities') else
+                'not allowed (to allow them, tick "Tools and files" for this computer in ConsoleX Settings > Coding agents)'))
+        elif status == 401:
+            lines.append('Connection: this computer was connected as %s, but ConsoleX no longer accepts it (the device '
+                         'was removed in ConsoleX, or the account is no longer active). Run /consolex:login to connect again.' % account)
+        else:
+            lines.append('Connection: saved for %s as %s, but ConsoleX could not confirm it (%s).' % (
+                api_base, account, body.get('error_msg') or ('HTTP %s' % status if status else 'unreachable')))
+    installed, unchecked = [], []
+    for folder in sorted(_installed_skills(env).values()):
+        config = _read_json(os.path.join(skills_dir(env), folder, 'consolex.json'), {})
+        installed.append('/%s (%s)' % (folder, config.get('task_name') or 'task'))
+        if not _token(config, env):
+            unchecked.append('/%s at %s' % (folder, _api(config, env)))
+    lines.append('Tasks added here: %s' % ('; '.join(installed) if installed else 'none yet (add one with /consolex:add)'))
+    if unchecked:
+        lines.append('Not checked from this computer: %s. This computer is not signed in to that ConsoleX address; run '
+                     '/consolex:login with that address to check them.' % '; '.join(unchecked))
+    marker, config = _session_config(env, data)
+    if marker and config:
+        lines.append('This session is working on the task "%s"; deliveries are checked.' % (config.get('task_name') or ''))
+    return _context(data, 'ConsoleX status on this computer:\n%s\n\nShow this to the user as is, in a few lines. Do not '
+                          'run anything.' % '\n'.join('- ' + line for line in lines))
 
 
 def _installed_skills(env):
@@ -477,7 +561,8 @@ def on_tasks(data, env, argument, http=http_json):
     if not tasks:
         return _context(data, 'No ConsoleX task matches. Tell the user in one line.')
     return _context(data, ('ConsoleX tasks (%s of %s):\n%s\n\nShow this list to the user as is. To add one to Claude Code '
-                           'they run /consolex:add followed by words from its name. Do not run anything.') % (
+                           'they run /consolex:add followed by words from its name; /consolex:start does one in this session without '
+                           'adding it. Do not run anything.') % (
         len(tasks), body.get('total', len(tasks)), _task_lines(tasks, _installed_skills(env))))
 
 
@@ -514,7 +599,7 @@ def on_add(data, env, argument, http=http_json):
         return _context(data, 'ConsoleX could not find tasks (%s). Tell the user.' % (body.get('error_msg') or 'HTTP %s' % status))
     tasks = body.get('tasks') or []
     if not tasks:
-        return _context(data, 'No ConsoleX task matches "%s". Tell the user; /consolex:tasks lists all tasks.' % query)
+        return _context(data, 'No ConsoleX task matches "%s". Tell the user; /consolex:add with no words lists all tasks.' % query)
     if len(tasks) > 1:
         return _context(data, ('Several ConsoleX tasks match "%s":\n%s\n\nAsk the user which one, then they run '
                                '/consolex:add with more words of its name. Do not run anything.') % (
@@ -532,9 +617,64 @@ def on_add(data, env, argument, http=http_json):
     note = '' if task.get('standard') else (' It has no acceptance standard yet, so deliveries are recorded but not '
                                             'checked until one is saved in ConsoleX.')
     note += _skills_note(outcome, bundle.get('skipped_skills') or [])
+    if folder == bundle['skill'] and name_loses_letters(task['name']):
+        # A Skill name holds only a-z, 0-9 and hyphens, so a Chinese (or Japanese, Cyrillic, …) task name comes out
+        # as cx-task-<id> or keeps only its Latin words. The agent names it in English, once, here.
+        return _context(data, (
+            'Added the ConsoleX task "%s" as the Skill /%s (%s).%s A Skill name can only hold a-z, 0-9 and hyphens, so '
+            'this one does not say what the task is. Give it a short English name now: translate what the task makes '
+            'into 2 to 4 words, like cx-weekly-client-report, and call the ConsoleX tool %s with skill "%s" and that '
+            'name. Then tell the user in two to four lines: the task was added as /<new name> (start it with that or '
+            'just ask for the task), and they can ask you for a different name. If the tool is not available or '
+            'fails, tell them it was added as /%s instead. Do not run anything else.') % (
+            task['name'], folder, target, note, RENAME_SKILL_TOOL, folder, folder))
     return _context(data, ('Added the ConsoleX task "%s" as the Skill /%s (%s).%s Tell the user in two to four lines: start '
                            'it with /%s or just ask for the task. Do not run anything.') % (
         task['name'], folder, target, note, folder))
+
+
+def name_loses_letters(text):
+    """True when a name has letters a Skill name cannot keep (Chinese, Japanese, Cyrillic, …); accents are fine."""
+    return any(char.isalpha() and not char.isascii() for char in unicodedata.normalize('NFKD', text or ''))
+
+
+SKILL_NAME_LIMIT = 64  # Claude Code and the Agent Skills format allow at most 64 characters
+
+
+def rename_task_skill(env, skill, name, cwd=None):
+    """(new name, problem): rename an installed task Skill: its folder, the `name` in its SKILL.md and consolex.json.
+
+    `name` may be given with or without the cx- prefix; it is lower-cased and joined with hyphens. Later updates of
+    the task keep the new name, because an installed task is found by its task UUID, not by name."""
+    old = str(skill or '').strip().lstrip('/$')
+    new = re.sub(r'[^a-z0-9]+', '-', str(name or '').strip().lstrip('/$').lower()).strip('-')
+    if new and not new.startswith('cx-'):
+        new = 'cx-' + new
+    if not SKILL_NAME.fullmatch(old):
+        return '', 'Give skill as the current name of an installed ConsoleX task Skill, like "cx-task-8601".'
+    if not SKILL_NAME.fullmatch(new) or len(new) > SKILL_NAME_LIMIT:
+        return '', ('Give name as a few English words joined by hyphens, starting with cx- and at most %s characters, '
+                    'like "cx-weekly-client-report".' % SKILL_NAME_LIMIT)
+    folder = find_skill_dir(old, env, cwd or os.getcwd())
+    if not folder:
+        return '', 'No ConsoleX task Skill named %s is installed here.' % old
+    if new == old:
+        return new, ''
+    target = os.path.join(os.path.dirname(folder), new)
+    if os.path.exists(target):
+        return '', 'A Skill named %s already exists here; choose another name.' % new
+    config = load_config(folder)
+    os.rename(folder, target)
+    skill_md = os.path.join(target, 'SKILL.md')
+    text = _read_text(skill_md)
+    if text is not None:
+        text = re.sub(r'(?m)^name:[ \t]*["\']?%s["\']?[ \t]*$' % re.escape(old), 'name: ' + new, text, count=1)
+        with open(skill_md, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+    config['skill'] = new
+    with open(os.path.join(target, 'consolex.json'), 'w', encoding='utf-8') as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2)
+    return new, ''
 
 
 # ---------------------------------------------------------------- the ConsoleX Skills a task uses
@@ -686,6 +826,7 @@ def on_session_start(data, env, spawn=None):
     write_launcher(env)
     if not _installed_skills(env):
         return None
+    sync_schedules_if_changed(env)  # a schedule changed in the desktop app since the last sync reaches ConsoleX now
     state = _read_json(_refresh_state_path(env), {})
     state = state if isinstance(state, dict) else {}
     key = os.path.abspath(skills_dir(env))
@@ -726,6 +867,10 @@ def refresh_installed_tasks(env, http=http_json):
         _list_task_skills(target, outcome['installed'] + outcome['updated'] + outcome['current'] + outcome['kept'],
                           json.loads(bundle['files']['consolex.json']).get('language') == 'zh')
         results[task_uuid] = outcome
+    try:
+        reconcile_schedules(env, http=http)  # the desktop app's ConsoleX schedules, told to ConsoleX one way
+    except Exception:
+        pass
     return results
 
 
@@ -874,6 +1019,92 @@ def transcript_facts(transcript_path):
         if model and last_text:
             break
     return model, last_text
+
+
+def latest_turn_origin(transcript_path):
+    """Who started the latest turn the owner or a schedule began: 'scheduled' (a Claude desktop scheduled task),
+    'human', or None when unknown. Turns started by a background task's notification, another session's message or
+    the SDK say nothing about whether the owner is there, so they are skipped."""
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+    try:
+        with open(transcript_path, 'rb') as handle:
+            size = os.path.getsize(transcript_path)
+            handle.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            lines = handle.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get('type') != 'user' or entry.get('isMeta'):
+            continue
+        origin = entry.get('turnOrigin')
+        if origin in ('human', 'scheduled'):
+            return origin
+        if origin:
+            continue  # task_notification, peer, sdk, …
+        content = (entry.get('message') or {}).get('content')
+        if isinstance(content, list):
+            if any(isinstance(part, dict) and part.get('type') == 'tool_result' for part in content):
+                continue  # a tool's answer, not a prompt
+            content = '\n'.join(part.get('text') or '' for part in content if isinstance(part, dict))
+        if isinstance(content, str) and content.strip():
+            if content.lstrip().startswith('<task-notification'):
+                continue
+            return 'scheduled' if SCHEDULED_PROMPT.match(content) else 'human'
+    return None
+
+
+# The opening tag of a Claude desktop scheduled run's prompt names the scheduled task (its taskId).
+SCHEDULED_TASK_NAME = re.compile(r'\s*<scheduled-task\s[^>]*?\bname="([A-Za-z0-9._-]{1,128})"')
+
+
+def scheduled_task_id(data):
+    """The id of the desktop scheduled task that began the latest turn, or None: from the prompt itself in
+    UserPromptSubmit (a Claude desktop taskId or a Codex app automation id), else from the latest prompt in the
+    transcript (Claude Code only)."""
+    if data.get('hook_event_name') == 'UserPromptSubmit':
+        match = SCHEDULED_TASK_NAME.match(data.get('prompt') or '')
+        return match.group(1) if match else codex_automation(data.get('prompt') or '')[0]
+    path = data.get('transcript_path')
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(max(0, os.path.getsize(path) - TRANSCRIPT_TAIL_BYTES))
+            lines = handle.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get('type') != 'user' or entry.get('isMeta') or entry.get('turnOrigin') not in (None, 'human', 'scheduled'):
+            continue
+        content = (entry.get('message') or {}).get('content')
+        if isinstance(content, list):
+            if any(isinstance(part, dict) and part.get('type') == 'tool_result' for part in content):
+                continue
+            content = '\n'.join(part.get('text') or '' for part in content if isinstance(part, dict))
+        if isinstance(content, str) and content.strip() and not content.lstrip().startswith('<task-notification'):
+            match = SCHEDULED_TASK_NAME.match(content)
+            return match.group(1) if match else None
+    return None
+
+
+def unattended(data, env, marker=None):
+    """True when nobody is there to answer: a headless isolated run (`consolex run --headless`, or the owner's own
+    scheduler setting CONSOLEX_UNATTENDED=1), or a turn that a Claude desktop or Codex app scheduled task started."""
+    if env.get('CONSOLEX_UNATTENDED') == '1':
+        return True
+    if data.get('hook_event_name') == 'UserPromptSubmit':
+        return scheduled_prompt(data.get('prompt'))
+    origin = latest_turn_origin(data.get('transcript_path'))
+    return origin == 'scheduled' if origin else bool((marker or {}).get('unattended'))
 
 
 def _entry_time(entry):
@@ -1142,6 +1373,59 @@ def confirm_reason(config, result_line, confirm_items):
             'repeat the deliverable, and do not invent anything that needs the owner\'s decision or information you do not have.')
 
 
+def unattended_reason(config, summary, link, confirm_items=()):
+    """The block reason for a run nobody attends: write the result down and end, without asking or revising."""
+    if _zh(config):
+        return (summary + ('\n运行记录：%s' % link if link else '') + _confirm_list(confirm_items, True) + '\n\n'
+                '这是无人值守运行，没人在场回答。现在不要修改交付物，不要重新交付，也不要提问。'
+                '用一条简短的消息（用对话的语言）写下这个结果：逐项列出上面没通过或要确认的检查项和原因，附上运行记录链接，然后结束。'
+                '负责人回来后会决定要不要修改。这条消息里不要写"ConsoleX 交付"段。')
+    return (summary + ('\nRun: %s' % link if link else '') + _confirm_list(confirm_items, False) + '\n\n'
+            'This is an unattended run: nobody is there to answer. Do not change the deliverable, deliver again or ask '
+            'anything now. In one short message, in the language of the conversation, write this result down: list the '
+            'checks above that failed or need review, with their reasons and the run link, then stop. The owner decides '
+            'about revising when they are back. Do not include a "ConsoleX delivery" section in this message.')
+
+
+def redeclare_reason(config, summary):
+    """Unattended and the declared files cannot be read: fix the delivery section once, never the deliverable."""
+    if _zh(config):
+        return (summary + '\n\n这是无人值守运行，没人在场回答。只修正回复结尾「ConsoleX 交付」段里的文件：写相对当前目录的路径，'
+                '只列本次写好的文本文件；然后照输出约定重新交付一次。不要修改交付内容本身。')
+    return (summary + '\n\nThis is an unattended run: nobody is there to answer. Fix only the files in the "ConsoleX delivery" '
+            'section at the end of your reply: paths relative to the current folder, only text files written for this task. '
+            'Then deliver once more following the output contract. Do not change the deliverable itself.')
+
+
+def fix_reason(config, result, attempt, link, fixable, round_):
+    """The task lets the agent fix failed rule checks: send it back with those items; AI-judged items stay reported."""
+    zh = _zh(config)
+    judged = [item for item in (result.get('failed') or []) + (result.get('needs_review') or []) if item not in fixable]
+    if zh:
+        return (('ConsoleX 检查了这次交付（第 %s 次），有规则检查没通过：\n%s' % (attempt, _check_lines(fixable, True)))
+                + ('\n运行记录：%s' % link if link else '') + '\n\n'
+                '这个任务设置为：规则检查没通过时，按没过的项修改后重新交付。现在按上面这些项修改交付物，只改它们涉及的地方，'
+                '不要为了通过检查加入与任务无关的内容；然后照输出约定重新交付（保留"ConsoleX 交付"段）。'
+                '这是第 %s 次自动修改，最多 %s 次。' % (round_, MAX_AGENT_FIXES)
+                + ('\n\n下面这些是 AI 判定的项，不要为它们修改，留给负责人决定：\n%s' % _check_lines(judged, True) if judged else ''))
+    return (('ConsoleX checked this delivery (attempt %s); rule checks failed:\n%s' % (attempt, _check_lines(fixable, False)))
+            + ('\nRun: %s' % link if link else '') + '\n\n'
+            'This task is set to have failed rule checks fixed and delivered again. Revise the deliverable for the items '
+            'above, changing only what they concern and adding nothing unrelated to the task just to pass; then deliver '
+            'again following the output contract (keep the "ConsoleX delivery" section). This is automatic fix %s of at '
+            'most %s.' % (round_, MAX_AGENT_FIXES)
+            + ('\n\nThese are AI-judged checks: do not revise for them; the owner decides:\n%s' % _check_lines(judged, False)
+               if judged else ''))
+
+
+def fix_message(config, fixable, attempt, link, round_):
+    names = ('、' if _zh(config) else ', ').join(short_name(item.get('name')) for item in fixable)
+    tail = (' · ' + link) if link else ''
+    return (('ConsoleX ✗ 第 %s 次交付未通过：%s；按任务设置修改规则项后重新交付（第 %s/%s 次）%s' if _zh(config) else
+             'ConsoleX ✗ attempt %s failed: %s; fixing the rule checks as the task allows (%s of %s)%s')
+            % (attempt, names, round_, MAX_AGENT_FIXES, tail))
+
+
 def result_summary(config, result, attempt):
     zh = _zh(config)
     parts = []
@@ -1196,6 +1480,26 @@ def _outdated_note(config):
 
 # ---------------------------------------------------------------- hook handlers
 
+def _unattended_note(zh):
+    return ('\n\nConsoleX：这是无人值守运行（定时任务或 --headless），没人在场回答问题。不要用 AskUserQuestion，也不要停下来等确认：'
+            '需要负责人决定或核实的事写进「待你确认」，方法要求做的照方法做完，然后照输出约定交付。' if zh else
+            '\n\nConsoleX: this is an unattended run (a scheduled task or --headless); nobody is there to answer. Do not '
+            'use AskUserQuestion or stop to wait for a confirmation: put what the owner must decide or verify under the '
+            'confirmation heading, finish what the method says, then deliver following the output contract.')
+
+
+def _on_failure_note(zh):
+    return (('\n\nConsoleX：这个任务设置为，规则检查没通过时你按没过的项修改并重新交付（最多 %s 次）；AI 判定的项只汇报，不为它们修改。'
+             if zh else '\n\nConsoleX: this task is set to have you fix failed rule checks and deliver again (at most %s '
+             'times); AI-judged checks are only reported, never revised for.') % MAX_AGENT_FIXES)
+
+
+ASK_DENIED = ('ConsoleX：这是无人值守运行，没人会回答。不要提问：把要负责人决定或核实的事写进「待你确认」，选一个合理的做法继续，'
+              '在交付里说明你的选择。', 'ConsoleX: this is an unattended run and nobody will answer. Do not ask: put what the '
+              'owner must decide or verify under the confirmation heading, carry on with a reasonable choice and say in the '
+              'delivery what you chose.')
+
+
 def activate(data, env, skill_dir, http=http_json):
     """Mark the session as working on this Task and add the latest approved method to context."""
     config = load_config(skill_dir)
@@ -1209,6 +1513,10 @@ def activate(data, env, skill_dir, http=http_json):
                   'started_at': time.time(), 'chains': {}}
     marker.pop('standard', None)  # Markers from plugin 0.6 and earlier kept a copy of the standard.
     marker['revision'] = config.get('revision')
+    marker['unattended'] = alone = unattended(data, env, marker)
+    schedule_id = scheduled_task_id(data) if alone else None
+    if schedule_id:
+        marker['schedule_id'] = schedule_id  # sent with each session event, so ConsoleX links the run to its schedule
     token = _token(config, env)
     if not token:
         save_marker(env, marker)
@@ -1223,8 +1531,11 @@ def activate(data, env, skill_dir, http=http_json):
         save_marker(env, marker)
         reason = body.get('error_msg') or ('HTTP %s' % status if status else 'unreachable')
         return _context(data, ('ConsoleX：拿不到最新方法（%s），按 Skill 里的 v%s 做。' if zh else
-                               'ConsoleX: could not fetch the latest method (%s); follow v%s in the Skill.') % (reason, exported))
+                               'ConsoleX: could not fetch the latest method (%s); follow v%s in the Skill.') % (reason, exported)
+                        + (_unattended_note(zh) if alone else ''))
     marker['revision'] = body.get('revision')
+    # An older ConsoleX sends no on_failure: report and wait, as before.
+    marker['on_failure'] = 'fix_rules' if body.get('on_failure') == 'fix_rules' else 'report'
     session_event(config, env, data, marker, 'start', http=http)
     save_marker(env, marker)
     latest = (body.get('revision') or {}).get('version')
@@ -1235,6 +1546,10 @@ def activate(data, env, skill_dir, http=http_json):
         note = (('ConsoleX：这个任务有更新的已批准方法 v%s（Skill 里是 v%s），以下面为准。\n\n## 方法\n%s\n\n## 输出约定\n%s') if zh else
                 ('ConsoleX: this task has a newer approved method v%s (the Skill holds v%s); follow this one.\n\n## Method\n%s\n\n'
                  '## Output contract\n%s')) % (latest, exported, body.get('instructions') or '', body.get('output_contract') or '')
+    if marker['on_failure'] == 'fix_rules':
+        note += _on_failure_note(zh)
+    if alone:
+        note += _unattended_note(zh)
     if isinstance(body.get('skills'), list):
         note += _sync_task_skills(env, config, skill_dir, token, body['skills'], zh, http)
     note += _task_tools_note(body.get('task_tools'), os.path.basename(os.path.normpath(skill_dir)), env, zh)
@@ -1244,6 +1559,8 @@ def activate(data, env, skill_dir, http=http_json):
 # Tools of the plugin's ConsoleX tool service in an ordinary session (MCP in Claude Code and Codex, native in DSH).
 TASK_TOOLS_TOOL = 'consolex_task_tools'
 RUN_TASK_TOOL = 'consolex_run_task_tool'
+RENAME_SKILL_TOOL = 'consolex_rename_skill'  # gives an added task Skill an English name (see on_add)
+SCHEDULE_TOOL = 'consolex_schedule'  # a Claude desktop scheduled run of an added task (Claude Code only; see on_schedule)
 
 
 def _tool_label(item, zh):
@@ -1309,7 +1626,7 @@ def _task_ref(env, task, cwd=None):
     name = str(task or '').strip().lstrip('/$')
     if not SKILL_NAME.fullmatch(name):
         return None, 'Give task as the name of an installed ConsoleX task Skill, like "cx-weekly-note".'
-    folder = find_skill_dir(name, env, cwd or os.getcwd())
+    folder = find_skill_dir(name, env, cwd or os.getcwd()) or _started_skill_dir(env, name)
     if not folder:
         return None, 'The ConsoleX task %s is not installed on this computer; add it with /consolex:add.' % name
     return load_config(folder), ''
@@ -1384,9 +1701,11 @@ def session_event(config, env, data, marker, event, http=http_json):
     marker['beat_at'] = time.time()
     if event in SESSION_STATES:
         marker['state'] = SESSION_STATES[event]
+    payload = {'session_id': data.get('session_id'), 'event': event, 'runtime': client(env)}
+    if marker.get('schedule_id'):
+        payload['schedule_id'] = marker['schedule_id']  # a Claude desktop scheduled run: which schedule started it
     try:
-        http('POST', _task_url(config, env, 'sessions'), token,
-             {'session_id': data.get('session_id'), 'event': event, 'runtime': client(env)}, timeout=SESSION_TIMEOUT)
+        http('POST', _task_url(config, env, 'sessions'), token, payload, timeout=SESSION_TIMEOUT)
     except Exception:
         pass
 
@@ -1439,6 +1758,31 @@ def build_output(config, env, marker, data, delivery):
     return delivery['body'], '', ([] if delivery['body'].strip() else ['empty deliverable'])
 
 
+def work_seconds(marker, now=None):
+    """Seconds the agent worked on this delivery, by this computer's clock, or None when unknown.
+
+    The work began at the latest of: the task starting in this session, the owner's latest message, the previous
+    delivery, or the owner's answer after it. So time between turns and time the owner took to decide on a result
+    never count; time spent answering a question in the middle of the work does."""
+    now = time.time() if now is None else now
+    began = max(float(marker.get(key) or 0) for key in ('started_at', 'prompt_at', 'delivered_at', 'answered_at'))
+    if not began or not 0 <= now - began <= MAX_WORK_SECONDS:
+        return None
+    return round(now - began, 1)
+
+
+def note_owner_answer(data, env):
+    """The owner answered the first question after a delivery (whether to revise, or the items to confirm): the
+    next delivery's work starts now."""
+    marker, _ = _session_config(env, data)
+    if not marker:
+        return
+    delivered = float(marker.get('delivered_at') or 0)
+    if delivered and delivered > max(float(marker.get(key) or 0) for key in ('prompt_at', 'answered_at')):
+        marker['answered_at'] = time.time()
+        save_marker(env, marker)
+
+
 def submit(config, env, marker, data, delivery, output_text, agent_note, *, trigger, attempt, prompt_id, http=http_json):
     """(status, body) of submitting one delivery attempt to ConsoleX."""
     model = data.get('model') or transcript_facts(data.get('transcript_path'))[0]
@@ -1455,6 +1799,9 @@ def submit(config, env, marker, data, delivery, output_text, agent_note, *, trig
         payload['isolated'] = True  # Started by `consolex run`: the run record says so.
     if env.get('CONSOLEX_TOOL_SESSION'):
         payload['tool_session_id'] = env['CONSOLEX_TOOL_SESSION']  # where this run's ConsoleX tool calls are recorded
+    seconds = work_seconds(marker) if trigger == 'stop' else None
+    if seconds is not None:
+        payload['elapsed_seconds'] = seconds  # the run's duration; ConsoleX dates its start back by it
     return http('POST', _task_url(config, env, 'runs'), _token(config, env), payload, timeout=SUBMIT_TIMEOUT)
 
 
@@ -1478,10 +1825,13 @@ def on_stop(data, env, http=http_json):
     prompt_id = str(data.get('prompt_id') or 'turn')
     chains = marker.setdefault('chains', {})
     chain = chains.get(prompt_id)
+    alone = unattended(data, env, marker)
     if data.get('stop_hook_active'):
         if not chain or not chain.get('reported_at'):
             return None  # Continuing for another hook's reason; never start a loop from here.
-        if not (data.get('owner_answered') or owner_answered_since(data.get('transcript_path'), float(chain['reported_at']))):
+        if chain.get('sent_back'):
+            chain['sent_back'] = False  # The plugin itself sent Claude back to fix this delivery: check it.
+        elif not (data.get('owner_answered') or owner_answered_since(data.get('transcript_path'), float(chain['reported_at']))):
             # Claude delivered again right after reporting a result, without the owner's answer.
             return {'systemMessage': ('ConsoleX：没等你确认就重新交付了，这次没有检查；要检查就运行 /consolex:check。' if zh else
                                       'ConsoleX: delivered again without your answer, so this was not checked; '
@@ -1500,28 +1850,41 @@ def on_stop(data, env, http=http_json):
                     'paths relative to the current folder, to text files changed in this task.)') % '\n- '.join(problems))
         message = ('ConsoleX：交付读不到，没有检查：%s；等你决定要不要修改' if zh else
                    'ConsoleX: deliverable unreadable, not checked: %s; waiting for your decision') % '; '.join(problems)
-        return _report(env, marker, chain, prompt_id, report_reason(config, summary, '', delivery['confirm_items']), message)
+        if alone and not chain.get('redeclared'):
+            chain['redeclared'] = chain['sent_back'] = True
+            return _report(env, marker, chain, prompt_id, redeclare_reason(config, summary), message)
+        reason = (unattended_reason if alone else report_reason)(config, summary, '', delivery['confirm_items'])
+        return _report(env, marker, chain, prompt_id, reason, message)
     status, result = submit(config, env, marker, data, delivery, output_text, agent_note,
                             trigger='stop', attempt=attempt, prompt_id=prompt_id, http=http)
     marker['attempts'] = attempt
+    marker['delivered_at'] = time.time()  # the next delivery's work starts after this one
     chain['attempt'] = attempt
     chains[prompt_id] = chain
     if status != 200 or not (result or {}).get('succ'):
         why = (result or {}).get('error_msg') or ('HTTP %s' % status if status else 'unreachable')
         # No local fallback: the standard is only on the server, so an unreachable ConsoleX means not checked.
         message = ('ConsoleX：这次交付没有检查（%s）。' if zh else 'ConsoleX: this delivery was not checked (%s).') % why
-        return _finish(env, marker, chain, prompt_id, config, message, delivery['confirm_items'])
+        return _finish(env, marker, chain, prompt_id, config, message, delivery['confirm_items'], ask=not alone)
     link = _run_link(config, env, result)
     if result.get('verdict') in ('failed', 'needs_review'):
+        fixable = [item for item in result.get('failed') or [] if item.get('kind') == 'rule']
+        fixes = int(chain.get('fixes') or 0)
+        if marker.get('on_failure') == 'fix_rules' and fixable and fixes < MAX_AGENT_FIXES:
+            chain['fixes'], chain['sent_back'] = fixes + 1, True
+            return _report(env, marker, chain, prompt_id, fix_reason(config, result, attempt, link, fixable, fixes + 1),
+                           fix_message(config, fixable, attempt, link, fixes + 1))
         summary = result_summary(config, result, attempt)
-        return _report(env, marker, chain, prompt_id, report_reason(config, summary, link, delivery['confirm_items']),
-                       user_message(config, result, attempt, link))
-    return _finish(env, marker, chain, prompt_id, config, user_message(config, result, attempt, link), delivery['confirm_items'])
+        reason = (unattended_reason if alone else report_reason)(config, summary, link, delivery['confirm_items'])
+        return _report(env, marker, chain, prompt_id, reason, user_message(config, result, attempt, link))
+    return _finish(env, marker, chain, prompt_id, config, user_message(config, result, attempt, link),
+                   delivery['confirm_items'], ask=not alone)
 
 
-def _finish(env, marker, chain, prompt_id, config, message, confirm_items):
-    """End the turn with the result line, or, when the delivery lists items to confirm, block once so Claude asks the owner."""
-    if confirm_items:
+def _finish(env, marker, chain, prompt_id, config, message, confirm_items, ask=True):
+    """End the turn with the result line, or, when the delivery lists items to confirm and someone is there to
+    answer, block once so Claude asks the owner. Unattended, the items stay in the delivery and the run record."""
+    if confirm_items and ask:
         return _report(env, marker, chain, prompt_id, confirm_reason(config, message, confirm_items), message)
     save_marker(env, marker)
     return {'systemMessage': message}
@@ -1907,7 +2270,8 @@ def _claude_command(prepared, request='', headless=False):
     if headless:
         argv += ['-p', '--output-format', 'json']
     argv.append(prompt)
-    return argv, {**ISOLATED_ENV, 'CONSOLEX_SKILLS_DIR': os.path.join(prepared['root'], '.claude', 'skills'),
+    return argv, {**ISOLATED_ENV, 'CONSOLEX_UNATTENDED': '1' if headless else None,
+                  'CONSOLEX_SKILLS_DIR': os.path.join(prepared['root'], '.claude', 'skills'),
                   'CONSOLEX_API_BASE': prepared['api_base'], 'CONSOLEX_TOOL_SESSION': prepared['tool_session']}
 
 
@@ -1965,6 +2329,7 @@ def _dsh_command(prepared, request='', headless=True):
     argv = ['dsh', '--profile', DSH_PROFILE, '--patch', prepared['dsh_patch'], prompt]
     return argv, {'DSH_HOME': prepared['dsh_home'], 'DSH_AGENTS_HOME': prepared['dsh_agents_home'],
                   'DSH_TELEMETRY_DISABLED': '1', 'CONSOLEX_ISOLATED': '1', 'CONSOLEX_RUNTIME': 'deepseek_harness',
+                  'CONSOLEX_UNATTENDED': '1',
                   'CONSOLEX_SKILLS_DIR': prepared['skills_dir'], 'CONSOLEX_API_BASE': prepared['api_base'],
                   'CONSOLEX_TOOL_SESSION': prepared['tool_session']}
 
@@ -2073,6 +2438,7 @@ def _codex_command(prepared, request='', headless=False):
             else ['codex', '--no-daemon', *common, prompt])
     return argv, {'CODEX_HOME': prepared['codex_home'], 'HOME': prepared['fake_home'], 'CODEX_API_KEY': None,
                   'CONSOLEX_HOME': prepared['consolex_home'], 'CONSOLEX_ISOLATED': '1', 'CONSOLEX_RUNTIME': 'codex',
+                  'CONSOLEX_UNATTENDED': '1' if headless else None,
                   'CONSOLEX_SKILLS_DIR': prepared['skills_dir'], 'CONSOLEX_API_BASE': prepared['api_base'],
                   'CONSOLEX_TOOL_SESSION': prepared['tool_session']}
 
@@ -2131,9 +2497,1093 @@ def on_run_command(data, env, argument, http=http_json):
         else 'Add --headless to run it once without a session window.'))
 
 
-COMMANDS = {'consolex:login': on_login, 'consolex:logout': on_logout, 'consolex:tasks': on_tasks,
-            'consolex:add': on_add, 'consolex:check': on_check_command, 'consolex:save': on_save,
-            'consolex:run': on_run_command}
+def _installed_task_list(env):
+    """[(Skill folder, consolex.json)] of the task Skills added on this computer, by folder name."""
+    found, root = [], skills_dir(env)
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return found
+    for name in names:
+        config = _read_json(os.path.join(root, name, 'consolex.json'), None)
+        if isinstance(config, dict) and config.get('task_uuid') and SKILL_NAME.fullmatch(name):
+            found.append((name, config))
+    return found
+
+
+def _match_installed_task(installed, words):
+    """The added tasks that `words` name: a cx-… Skill name, a ConsoleX task link, or words from the task name."""
+    text = words.strip().lstrip('/$').strip()
+    if not text:
+        return []
+    link = _TASK_LINK.search(text)
+    if link:
+        return [item for item in installed if item[1]['task_uuid'].lower() == link.group(0).lower()]
+    exact = [item for item in installed if item[0] == text]
+    if exact:
+        return exact
+    tokens = text.casefold().split()
+    return [item for item in installed
+            if all(token in (item[1].get('task_name') or '').casefold() or token in item[0] for token in tokens)]
+
+
+def schedule_prompt(config, skill, cwd, runtime='claude_code'):
+    """The fixed prompt of a scheduled run: where to run and which task. Everything about the work itself stays in
+    the task's method in ConsoleX, so an approved change there reaches every scheduled run without editing this.
+
+    In Codex the prompt opens with `$cx-…`: Codex loads a Skill named that way, and the ConsoleX hook starts the
+    task from the same mention (a Codex scheduled run has no Skill tool to call)."""
+    name = config.get('task_name') or skill
+    if runtime == 'codex':
+        if _zh(config):
+            return ('$%s\n\n定时运行 ConsoleX 任务「%s」。这是无人值守运行，没人在场回答问题。\n\n'
+                    '工作目录：%s（所有命令都在这里执行）。\n\n'
+                    '1. 按上面的 ConsoleX 任务技能 `$%s` 的方法和输出约定完成这一次任务。技能加载后 ConsoleX 插件会注入最新已批准的方法，'
+                    '交付时把结果交给 ConsoleX 验收。找不到这个技能时（可能改过名），用技能列表里描述以 Do the ConsoleX task "%s" 开头的那个 cx- 技能。\n'
+                    '2. 做什么、做到什么程度、要做哪些操作，都以这个任务的方法为准。方法要求的操作，包括上传、发布、发送这类写操作，这份定时任务都授权你去做；'
+                    '方法没要求的写操作不要做。\n'
+                    '3. 需要负责人决定或核实的事写进「待你确认」，然后照常交付；验收结果按 ConsoleX 插件给你的说明处理。\n') % (
+                skill, name, cwd, skill, name)
+        return ('$%s\n\nScheduled run of the ConsoleX task "%s". This is an unattended run: nobody is there to answer '
+                'questions.\n\nWorking folder: %s (run every command here).\n\n'
+                '1. Do this run of the task by the method and output contract of the ConsoleX task Skill `$%s` named '
+                'above. When it loads, the ConsoleX plugin adds the latest approved method, and your delivery goes to '
+                'ConsoleX to be checked. If that Skill is not found (it may have been renamed), use the cx- Skill whose '
+                'description starts with Do the ConsoleX task "%s".\n'
+                '2. What to do, how far to take it and which actions to take all come from the task\'s method. This '
+                'scheduled task authorizes every action the method asks for, including write actions such as uploading, '
+                'publishing or sending; take no write action the method does not ask for.\n'
+                '3. Put what the owner must decide or verify under the confirmation heading and deliver as usual; handle '
+                'the check result as the ConsoleX plugin tells you.\n') % (skill, name, cwd, skill, name)
+    if _zh(config):
+        return ('定时运行 ConsoleX 任务「%s」。这是无人值守运行，没人在场回答问题。\n\n'
+                '工作目录：%s（所有命令都在这里执行）。\n\n'
+                '1. 用 Skill 工具加载 ConsoleX 任务技能 `%s`，按它的方法和输出约定完成这一次任务。加载后 ConsoleX 插件会注入最新已批准的方法，'
+                '交付时把结果交给 ConsoleX 验收。找不到这个名字时（技能可能改过名），用技能列表里描述以 Do the ConsoleX task "%s" 开头的那个 cx- 技能。\n'
+                '2. 做什么、做到什么程度、要做哪些操作，都以这个任务的方法为准。方法要求的操作，包括上传、发布、发送这类写操作，这份任务文件都授权你去做；'
+                '方法没要求的写操作不要做。\n'
+                '3. 需要负责人决定或核实的事写进「待你确认」，然后照常交付；验收结果按 ConsoleX 插件给你的说明处理。\n') % (name, cwd, skill, name)
+    return ('Scheduled run of the ConsoleX task "%s". This is an unattended run: nobody is there to answer questions.\n\n'
+            'Working folder: %s (run every command here).\n\n'
+            '1. Load the ConsoleX task Skill `%s` with the Skill tool and do this run of the task by its method and output '
+            'contract. When it loads, the ConsoleX plugin adds the latest approved method, and your delivery goes to ConsoleX '
+            'to be checked. If that name is not found (the Skill may have been renamed), use the cx- Skill whose description '
+            'starts with Do the ConsoleX task "%s".\n'
+            '2. What to do, how far to take it and which actions to take all come from the task\'s method. This task file '
+            'authorizes every action the method asks for, including write actions such as uploading, publishing or sending; '
+            'take no write action the method does not ask for.\n'
+            '3. Put what the owner must decide or verify under the confirmation heading and deliver as usual; handle the '
+            'check result as the ConsoleX plugin tells you.\n') % (name, cwd, skill, name)
+
+
+def _split_task_words(installed, argument):
+    """(matches, task words, the rest) for `<task> [--] <when>`. The dashes split it when given. Otherwise the longest
+    run of leading words that still names an added task is the task (`小语评球 每天 8:00`) and, when no whole word does,
+    the longest start of a first word in a language written without spaces (`小语评球每天8点`). Every word must be in the
+    task's name, so a longer run only narrows."""
+    parts = re.split(r'(?:^|\s)--(?:\s|$)', argument, maxsplit=1)
+    if len(parts) == 2:
+        return _match_installed_task(installed, parts[0]), parts[0].strip(), parts[1].strip()
+    words = argument.split()
+    for count in range(len(words), 0, -1):
+        matches = _match_installed_task(installed, ' '.join(words[:count]))
+        if matches:
+            return matches, ' '.join(words[:count]), ' '.join(words[count:])
+    first = words[0].lstrip('/$') if words else ''
+    if not first.isascii():
+        for size in range(len(first) - 1, 1, -1):
+            matches = _match_installed_task(installed, first[:size])
+            if matches:
+                return matches, first[:size], ' '.join([first[size:]] + words[1:])
+    return [], argument.strip(), ''
+
+
+def _scheduled_tasks_dir(env):
+    """Where the Claude desktop app keeps its scheduled tasks: one folder per taskId, each with a SKILL.md."""
+    return (env.get('CONSOLEX_SCHEDULED_TASKS_DIR') or os.environ.get('CONSOLEX_SCHEDULED_TASKS_DIR')
+            or os.path.join(os.path.expanduser('~'), '.claude', 'scheduled-tasks'))
+
+
+# The working folder and the section about places on this computer in a scheduled prompt (see schedule_prompt).
+_SCHEDULED_FOLDER = re.compile(r'^(?:工作目录：(.+?)（所有命令都在这里执行）。?|Working folder: (.+?) \(run every command here\)\.?)\s*$',
+                               re.MULTILINE)
+_SCHEDULED_NOTES = re.compile(r'^\s{0,3}(?:#{1,4}\s*)?(?:本机说明|On this computer)\s*[:：]?\s*$', re.MULTILINE)
+
+
+def _scheduled_runs_of(env, skill):
+    """[{taskId, folder, notes, enabled}] of the desktop scheduled tasks on this computer whose prompt loads `skill`:
+    the Claude desktop app's in Claude Code, the Codex app's (its standalone "cron" automations) in Codex.
+
+    Deleting a Claude desktop scheduled task leaves its SKILL.md on disk, so when the desktop app's state can be
+    read, only the tasks it still has count. `enabled` is None when that state cannot be read."""
+    loads = re.compile(r'(?<![a-z0-9-])%s(?![a-z0-9-])' % re.escape(skill))
+    if client(env) == 'codex':
+        automations, _ = read_codex_automations(env)
+        found = []
+        for automation_id, entry in sorted((automations or {}).items()):
+            text = entry.get('prompt') or ''
+            if entry.get('kind') != 'cron' or not loads.search(text):
+                continue
+            folder, notes = _SCHEDULED_FOLDER.search(text), _SCHEDULED_NOTES.search(text)
+            cwds = entry.get('cwds') if isinstance(entry.get('cwds'), list) else []
+            found.append({'taskId': automation_id,
+                          'folder': (folder.group(1) or folder.group(2)).strip() if folder else str((cwds or [''])[0]),
+                          'notes': text[notes.end():].strip() if notes else '',
+                          'enabled': entry.get('status') == 'ACTIVE'})
+        return found
+    root, found = _scheduled_tasks_dir(env), []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return found
+    state = read_desktop_schedules(env)
+    if state is not None:
+        names = [name for name in names if name in state]
+    for name in names:
+        try:
+            with open(os.path.join(root, name, 'SKILL.md'), encoding='utf-8') as handle:
+                text = handle.read(MAX_FILE_BYTES)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if loads.search(text):
+            folder, notes = _SCHEDULED_FOLDER.search(text), _SCHEDULED_NOTES.search(text)
+            found.append({'taskId': name, 'folder': (folder.group(1) or folder.group(2)).strip() if folder else '',
+                          'notes': text[notes.end():].strip() if notes else '',
+                          'enabled': None if state is None else state[name].get('enabled') is not False})
+    return found
+
+
+def _with_notes(prompt, old, new, zh):
+    """`prompt` ending with the places on this computer the runs should know: the ones it had, then any new ones."""
+    old, new = (old or '').strip(), (new or '').strip()
+    notes = old if not new or new in old else ('%s\n%s' % (old, new)).strip()
+    return prompt + ('\n%s\n%s\n' % ('本机说明' if zh else 'On this computer', notes) if notes else '')
+
+
+def _local_time_zone():
+    now = datetime.now().astimezone()
+    return '%s, UTC%s' % (now.tzname(), now.strftime('%z'))
+
+
+NO_TASK_TO_SCHEDULE = ("No ConsoleX task is added on this computer, and a scheduled run needs the task's Skill here. Tell "
+                       'the user to add it first with /consolex:add followed by words from its name, then set the '
+                       'schedule again. Do not create anything.')
+
+
+def _not_one_task(installed, words, matches):
+    listing = '\n'.join('- /%s — %s' % (name, config.get('task_name') or name) for name, config in installed)
+    return ('%s Tasks added on this computer:\n%s\n\nShow this list and ask the user which task to schedule (a task that '
+            'is not listed needs /consolex:add first). Do not create anything.') % (
+        'Several added tasks match "%s".' % words if matches else
+        'No added task matches "%s".' % words if words else 'Say which task to schedule.', listing)
+
+
+def schedule_steps(env, skill, config, cwd, notes='', when=None, http=http_json):
+    """How Claude sets up a scheduled run of an added task, the same from /consolex:schedule and the consolex_schedule
+    tool: the desktop scheduled tasks that already run it, each with the prompt to update it with (its own folder and
+    notes kept), and a free taskId with the prompt of a new one. Claude only turns the time into a cron expression and
+    passes these along; it never writes a scheduled prompt, so nothing it hears can end up in one."""
+    name, zh = config.get('task_name') or skill, _zh(config)
+    runs = _scheduled_runs_of(env, skill)
+    gate, gate_text = _schedule_gate(env, config, http)
+    if client(env) == 'codex':
+        return _codex_schedule_steps(env, skill, config, cwd, notes, when, runs, gate, gate_text)
+    if gate == 'block':
+        # A task runs from one place: nothing is created here while it runs elsewhere.
+        keep = (' If the user asks, you may still pause (update_scheduled_task with enabled false) or delete '
+                '(delete_scheduled_task) the scheduled tasks on this computer that run it: %s.' % ', '.join(
+                    '"%s"' % run['taskId'] for run in runs)) if runs else ''
+        return ('ConsoleX: a scheduled run of the ConsoleX task "%s" (/%s) in the Claude desktop app.\n\n%s Create no '
+                'scheduled task for it, and do not turn one on or change its time.%s') % (name, skill, gate_text, keep)
+    root, task_id, number = _scheduled_tasks_dir(env), 'consolex-' + skill, 1
+    while os.path.exists(os.path.join(root, task_id)):
+        number += 1
+        task_id = 'consolex-%s-%d' % (skill, number)
+    create = ('create_scheduled_task with taskId "%s", title "%s", description "%s", the cron expression and the prompt '
+              'for a new task below') % (task_id, name, ('ConsoleX 任务「%s」的定时运行，交付后由 ConsoleX 验收' if zh else
+                                                       'Scheduled run of the ConsoleX task "%s", checked by ConsoleX') % name)
+    if runs:
+        step = ('Scheduled tasks on this computer already run this task: %s. To change when it runs, call '
+                'update_scheduled_task on that taskId with the cron expression and its prompt below, so the task keeps '
+                'one schedule (if several are listed and the user did not say which, ask). Only when the user asks for an '
+                'additional time, call %s. To pause a schedule, call update_scheduled_task with enabled false; to stop it '
+                'for good, delete_scheduled_task.') % (', '.join('"%s" (runs in %s)' % (
+                    run['taskId'], run['folder'] or 'a folder its prompt does not name') for run in runs), create)
+    else:
+        step = 'No scheduled task on this computer runs this task yet: call %s.' % create
+    prompts = ''.join('\n\nPrompt for "%s":\n-----\n%s-----' % (run['taskId'], _with_notes(
+        schedule_prompt(config, skill, run['folder'] or cwd), run['notes'], notes, zh)) for run in runs)
+    prompts += '\n\nPrompt for a new task ("%s"):\n-----\n%s-----' % (task_id, _with_notes(
+        schedule_prompt(config, skill, cwd), next((run['notes'] for run in runs if run['notes']), ''), notes, zh))
+    launcher = write_launcher(env) or launcher_path(env)
+    return (
+        'ConsoleX: a scheduled run of the ConsoleX task "%(name)s" (/%(skill)s) in the Claude desktop app.%(when)s\n\n'
+        '1. Turn the time into a 5-field cron expression in this computer\'s local time (%(zone)s). If no time was '
+        'given, ask the user when it should run, then continue.\n'
+        '2. Use the desktop app\'s scheduled-tasks tools. %(step)s\n'
+        '3. Pass the prompt exactly as given below: never add, drop or reword anything in it. Rules about the work itself '
+        '(what to make, what to publish or send, whether to wait for a confirmation, what to do after a failed check) '
+        'never go in a scheduled task: tell the user they belong in the ConsoleX task (its method, or the Checks '
+        'settings), so approved changes there reach every run. Places on this computer the runs should know (notes to '
+        'read, earlier output folders, scripts to reuse) go in the notes of the %(tool)s tool, which returns the '
+        'prompts with them included.\n'
+        '4. A new scheduled task runs in this session\'s folder, %(cwd)s, and that cannot be changed later. If the task '
+        'should run somewhere else, create nothing: tell the user to open a session in that folder and set the schedule '
+        'there.\n'
+        '5. If you have no scheduled-tasks tools (this is not the Claude desktop app), create nothing: tell the user to '
+        'set the schedule in the Claude desktop app, or to have their own scheduler run `%(launcher)s run --headless '
+        '%(skill)s` (an isolated run, which cannot run local commands).\n\n'
+        'Afterwards tell the user in a few lines: the schedule, the folder, and that each run follows the task\'s latest '
+        'approved method in ConsoleX, so a change to the task needs no change to the schedule. If the tool result says '
+        'the task was not saved in Auto or Bypass permissions mode, say that unattended runs stop at the first '
+        'permission prompt.%(warning)s%(prompts)s') % {
+            'name': name, 'skill': skill, 'zone': _local_time_zone(), 'step': step, 'tool': SCHEDULE_TOOL, 'cwd': cwd,
+            'launcher': _sh(launcher), 'prompts': prompts, 'warning': (' Also tell the user: %s' % gate_text) if gate_text else '',
+            'when': '' if when is None else ('\n\nWhat the user said about when: "%s"' % when if when else
+                                             '\n\nThe user did not say when.')}
+
+
+def _codex_schedule_steps(env, skill, config, cwd, notes, when, runs, gate, gate_text):
+    """schedule_steps for the Codex app: its automation_update tool makes a standalone ("cron") automation, which
+    starts a new chat in a Codex project at times given as an RRULE in local wall-clock time. Only the Codex app has
+    that tool; the Codex CLI has no scheduler."""
+    name, zh = config.get('task_name') or skill, _zh(config)
+    if gate == 'block':
+        keep = (' If the user asks, you may still pause (automation_update with mode update and status PAUSED) or delete '
+                '(mode delete) the scheduled tasks in the Codex app that run it: %s.' % ', '.join(
+                    '"%s"' % run['taskId'] for run in runs)) if runs else ''
+        return ('ConsoleX: a scheduled run of the ConsoleX task "%s" ($%s) in the Codex app.\n\n%s Create no scheduled '
+                'task for it, and do not turn one on or change its time.%s') % (name, skill, gate_text, keep)
+    create = ('mode create, kind cron, name "%s", the RRULE, status ACTIVE, executionEnvironment local, the projectId '
+              'from step 4, this chat\'s own model and reasoning effort, and the prompt for a new task below') % name
+    if runs:
+        step = ('Scheduled tasks in the Codex app already run this task: %s. To change when it runs, call it with mode '
+                'update, that id, the new RRULE and its prompt below, keeping its other fields as they are, so the task '
+                'keeps one schedule (if several are listed and the user did not say which, ask). Only when the user asks '
+                'for an additional time, call it with %s. To pause a schedule, update it with status PAUSED; to stop it '
+                'for good, call it with mode delete.') % (', '.join('"%s" (runs in %s)' % (
+                    run['taskId'], run['folder'] or 'a folder its prompt does not name') for run in runs), create)
+    else:
+        step = 'No scheduled task in the Codex app runs this task yet: call it with %s.' % create
+    prompts = ''.join('\n\nPrompt for "%s":\n-----\n%s-----' % (run['taskId'], _with_notes(
+        schedule_prompt(config, skill, run['folder'] or cwd, 'codex'), run['notes'], notes, zh)) for run in runs)
+    prompts += '\n\nPrompt for a new task:\n-----\n%s-----' % _with_notes(
+        schedule_prompt(config, skill, cwd, 'codex'), next((run['notes'] for run in runs if run['notes']), ''), notes, zh)
+    launcher = write_launcher(env) or launcher_path(env)
+    return (
+        'ConsoleX: a scheduled run of the ConsoleX task "%(name)s" ($%(skill)s) in the Codex app.%(when)s\n\n'
+        '1. Turn the time into an RRULE in this computer\'s local time (%(zone)s), with FREQ, BYDAY, BYHOUR and BYMINUTE '
+        'only, never DTSTART. A scheduled task that starts a new chat takes a weekly or an hourly rule: every day at 8:30 '
+        'is FREQ=WEEKLY;BYDAY=SU,MO,TU,WE,TH,FR,SA;BYHOUR=8;BYMINUTE=30, weekdays at 8:30 is '
+        'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=30, every 2 hours is FREQ=HOURLY;INTERVAL=2;BYMINUTE=0. '
+        'Never show the RRULE to the user. If no time was given, ask the user when it should run, then continue.\n'
+        '2. Use the Codex app\'s automation_update tool (search for it if it is not loaded). %(step)s\n'
+        '3. Pass the prompt exactly as given below: never add, drop or reword anything in it. Rules about the work itself '
+        '(what to make, what to publish or send, whether to wait for a confirmation, what to do after a failed check) '
+        'never go in a scheduled task: tell the user they belong in the ConsoleX task (its method, or the Checks '
+        'settings), so approved changes there reach every run. Places on this computer the runs should know (notes to '
+        'read, earlier output folders, scripts to reuse) go in the notes of the %(tool)s tool, which returns the prompts '
+        'with them included.\n'
+        '4. A scheduled task runs in a Codex project: use the project whose folder is %(cwd)s (list_projects gives the '
+        'ids). If no Codex project has that folder, create nothing: tell the user to open that folder as a project in '
+        'the Codex app and ask again there.\n'
+        '5. If you have no automation_update tool (this is the Codex CLI, not the Codex app), create nothing: tell the '
+        'user to set the schedule in the Codex app, or to have their own scheduler run `%(launcher)s run --headless '
+        '%(skill)s` (an isolated run, which cannot run local commands).\n\n'
+        'Afterwards tell the user in a few lines: the schedule, the folder, that each run follows the task\'s latest '
+        'approved method in ConsoleX, so a change to the task needs no change to the schedule, and that the Codex app '
+        'must be open on this computer, awake, at that time (a run may start a few minutes early or late).'
+        '%(warning)s%(prompts)s') % {
+            'name': name, 'skill': skill, 'zone': _local_time_zone(), 'step': step, 'tool': SCHEDULE_TOOL, 'cwd': cwd,
+            'launcher': _sh(launcher), 'prompts': prompts, 'warning': (' Also tell the user: %s' % gate_text) if gate_text else '',
+            'when': '' if when is None else ('\n\nWhat the user said about when: "%s"' % when if when else
+                                             '\n\nThe user did not say when.')}
+
+
+def on_schedule(data, env, argument, http=http_json):
+    """`/consolex:schedule <task> [--] <when>`: a Claude desktop (Claude Code) or Codex app (Codex) scheduled task
+    for an added task."""
+    installed = _installed_task_list(env)
+    if not installed:
+        return _context(data, NO_TASK_TO_SCHEDULE)
+    matches, words, rest = _split_task_words(installed, argument)
+    if len(matches) != 1:
+        return _context(data, _not_one_task(installed, words, matches))
+    skill, config = matches[0]
+    return _context(data, schedule_steps(env, skill, config, data.get('cwd') or os.getcwd(), when=rest, http=http))
+
+
+def schedule_tool(env, task, notes, cwd, http=http_json):
+    """(text, problem) for the consolex_schedule tool: what /consolex:schedule gives, for the task `task` names."""
+    installed = _installed_task_list(env)
+    if not installed:
+        return '', NO_TASK_TO_SCHEDULE
+    matches, words, _ = _split_task_words(installed, str(task or ''))
+    if len(matches) != 1:
+        return '', _not_one_task(installed, words, matches)
+    skill, config = matches[0]
+    return schedule_steps(env, skill, config, cwd, notes=str(notes or ''), http=http), ''
+
+
+# ---------------------------------------------------------------- local schedules, told to ConsoleX one way
+#
+# ConsoleX keeps a Task's hosted schedule and its Claude desktop schedules exclusive, so a Task is never done and
+# published twice. The plugin tells it which desktop scheduled tasks run an added ConsoleX task: when Claude creates,
+# changes or deletes one (a PostToolUse hook), and from the desktop app's state file (the hourly refresh, and when a
+# scheduled run starts). The state file is undocumented and only verified on macOS: it is read, never written, and
+# anything unexpected means no report. ConsoleX never writes back. See docs/claude-code-checks.md, "Local schedules".
+
+SCHEDULE_TOOLS = ('mcp__scheduled-tasks__create_scheduled_task', 'mcp__scheduled-tasks__update_scheduled_task',
+                  'mcp__scheduled-tasks__delete_scheduled_task')
+MAX_REPORTED_SCHEDULES = 100
+_SCHEDULE_ID = re.compile(r'[A-Za-z0-9._-]{1,128}')
+_SKILL_REF = re.compile(r'(?<![a-z0-9-])cx-[a-z0-9-]{1,70}(?![a-z0-9-])')
+_TASK_NAME_REF = re.compile(r'Do the ConsoleX task "([^"\n]{1,200})"')
+_ZONE_NAME = re.compile(r'UTC|[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)+')
+
+
+def _desktop_state_paths(env):
+    # tests, or a desktop app that keeps it elsewhere
+    explicit = env.get('CONSOLEX_DESKTOP_SCHEDULES') or os.environ.get('CONSOLEX_DESKTOP_SCHEDULES')
+    if explicit:
+        return [explicit] if os.path.isfile(explicit) else []
+    root = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'Claude', 'claude-code-sessions')
+    return glob.glob(os.path.join(root, '*', '*', 'scheduled-tasks.json'))
+
+
+def read_desktop_schedules(env):
+    """{taskId: entry} of the Claude desktop app's scheduled tasks, or None when its state cannot be read as expected.
+
+    Each entry has `id`, `cronExpression` or `fireAt`, `enabled`, `filePath`, `cwd`, `permissionMode` and `lastRunAt`
+    (macOS, 2026-11). A file of another shape is skipped whole; with several (several accounts), the newest wins."""
+    def mtime(path):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0
+    found, read = {}, False
+    for path in sorted(_desktop_state_paths(env), key=mtime):
+        data = _read_json(path, None)
+        items = data.get('scheduledTasks') if isinstance(data, dict) else None
+        if not isinstance(items, list) or not all(isinstance(entry, dict) and isinstance(entry.get('id'), str)
+                                                   for entry in items):
+            continue
+        read = True
+        found.update({entry['id']: entry for entry in items if _SCHEDULE_ID.fullmatch(entry['id'])})
+    return found if read else None
+
+
+def _codex_automations_dir(env):
+    home = env.get('CODEX_HOME') or os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')
+    return os.path.join(home, 'automations')
+
+
+_TOML_KEY = re.compile(r'^([A-Za-z0-9_-]+)[ \t]*=[ \t]*(.*?)[ \t]*$')
+_TOML_PAIR = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^,}]+)')
+
+
+def _toml_value(text):
+    """One value of the flat TOML the Codex app writes: a one-line string, an array, an inline table, a boolean or a
+    number. None for anything else (a multi-line string, a date)."""
+    text = text.strip()
+    try:
+        if text.startswith(('"""', "'''")):
+            return None
+        if text.startswith(('"', '[')):
+            return json.loads(text)  # the app escapes \\ \" \n \r \t, which JSON reads the same way
+        if len(text) > 1 and text[0] == text[-1] == "'":
+            return text[1:-1]
+        if text.startswith('{') and text.endswith('}'):
+            return {key: _toml_value(value) for key, value in _TOML_PAIR.findall(text[1:-1])}
+        if text in ('true', 'false'):
+            return text == 'true'
+        return int(text) if re.fullmatch(r'-?\d+', text) else float(text)
+    except ValueError:
+        return None
+
+
+def _read_codex_automation(path):
+    """The top-level keys of one Codex automation.toml, or None when it is not the flat file the app writes."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            lines = handle.read(MAX_FILE_BYTES).splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    out = {}
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        if line.lstrip().startswith('['):
+            break  # a table follows the top-level keys
+        match = _TOML_KEY.match(line)
+        if not match:
+            return None  # a multi-line value: never read half a file
+        out[match.group(1)] = _toml_value(match.group(2))
+    return out if isinstance(out.get('id'), str) and isinstance(out.get('prompt'), str) else None
+
+
+def read_codex_automations(env):
+    """({id: automation}, complete) for the Codex app's automations on this computer ($CODEX_HOME/automations/<id>/
+    automation.toml), or (None, False) when there is no such folder. `complete` is False when a file could not be read,
+    so a report never marks deleted a schedule it could not see. Deleting an automation removes its folder (2026-11)."""
+    root = _codex_automations_dir(env)
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None, False
+    found, complete = {}, True
+    for name in names:
+        path = os.path.join(root, name, 'automation.toml')
+        if not os.path.isfile(path):
+            continue
+        entry = _read_codex_automation(path)
+        if entry is None or not _SCHEDULE_ID.fullmatch(entry['id']):
+            complete = False
+            continue
+        found[entry['id']] = entry
+    return found, complete
+
+
+_RRULE_DAYS = {'SU': 0, 'MO': 1, 'TU': 2, 'WE': 3, 'TH': 4, 'FR': 5, 'SA': 6}
+_RRULE_KEYS = {'FREQ', 'INTERVAL', 'BYDAY', 'BYHOUR', 'BYMINUTE', 'BYSECOND', 'BYMONTHDAY', 'WKST'}
+
+
+def rrule_cron(rrule):
+    """A 5-field cron expression, in the same local time, for the RRULEs the Codex app writes (weekly or daily
+    times, hourly or minute intervals, days of the month); None for one cron cannot say (DTSTART, COUNT, UNTIL, every
+    other week …). ConsoleX keeps local schedules as cron, and a schedule without one never blocks a hosted one."""
+    text = str(rrule or '').strip()
+    if not text or '\n' in text:
+        return None
+    parts = {}
+    for part in re.sub(r'^RRULE:', '', text, flags=re.IGNORECASE).split(';'):
+        key, sep, value = part.partition('=')
+        if not sep or not value.strip():
+            return None
+        parts[key.strip().upper()] = value.strip().upper()
+    if set(parts) - _RRULE_KEYS:
+        return None
+
+    def numbers(key, low, high):
+        if key not in parts:
+            return None
+        values = parts[key].split(',')
+        if not all(re.fullmatch(r'\d{1,2}', value) and low <= int(value) <= high for value in values):
+            raise ValueError(key)
+        return ','.join(str(number) for number in sorted({int(value) for value in values}))
+    try:
+        interval = int(parts.get('INTERVAL', '1'))
+        minute, hour, monthday = numbers('BYMINUTE', 0, 59), numbers('BYHOUR', 0, 23), numbers('BYMONTHDAY', 1, 31)
+    except ValueError:
+        return None
+    days = '*'
+    if 'BYDAY' in parts:
+        codes = parts['BYDAY'].split(',')
+        if not all(code in _RRULE_DAYS for code in codes):
+            return None  # 1MO, -1FR …
+        found = sorted({_RRULE_DAYS[code] for code in codes})
+        days = '*' if len(found) == 7 else ','.join(map(str, found))
+    freq = parts.get('FREQ')
+    if interval < 1:
+        return None
+    if freq == 'MINUTELY':
+        if hour or monthday or minute or interval >= 60:
+            return None
+        return '%s * * * %s' % ('*' if interval == 1 else '*/%d' % interval, days)
+    if freq == 'HOURLY':
+        if hour or monthday or interval >= 24:
+            return None
+        return '%s %s * * %s' % (minute or '0', '*' if interval == 1 else '*/%d' % interval, days)
+    if interval != 1 or minute is None or hour is None:
+        return None  # every other week, or a time taken from DTSTART
+    if freq == 'DAILY' and not monthday:
+        return '%s %s * * %s' % (minute, hour, days)
+    if freq == 'WEEKLY' and not monthday and 'BYDAY' in parts:
+        return '%s %s * * %s' % (minute, hour, days)
+    if freq == 'MONTHLY' and monthday and days == '*':
+        return '%s %s %s * *' % (minute, hour, monthday)
+    return None
+
+
+def _codex_schedule_item(automation_id, entry, config):
+    """One Codex app automation as ConsoleX stores it. Its RRULE becomes cron; the app keeps no permission mode."""
+    return {'schedule_id': automation_id, 'task_uuid': config.get('task_uuid'), 'timezone': local_time_zone_name(),
+            'cron': rrule_cron(entry.get('rrule')), 'fire_at': None, 'enabled': entry.get('status') == 'ACTIVE'}
+
+
+def _local_schedule_items(env, installed):
+    """([(skill, item)], complete) for the scheduled tasks on this computer that run an added task, from the
+    desktop app this runtime has; None when there is none or it cannot be read."""
+    if client(env) == 'claude_code':
+        state = read_desktop_schedules(env)
+        if state is None:
+            return None
+        found = []
+        for schedule_id, entry in state.items():
+            skill = _schedule_skill(_scheduled_skill_text(env, schedule_id, entry), installed)
+            if skill:
+                found.append((skill, _schedule_item(schedule_id, entry, installed[skill])))
+        return found, True
+    if client(env) == 'codex':
+        automations, complete = read_codex_automations(env)
+        if automations is None:
+            return None
+        found = []
+        for automation_id, entry in automations.items():
+            # A heartbeat continues one chat; only a standalone ("cron") automation starts a run of its own.
+            skill = _schedule_skill(entry.get('prompt'), installed) if entry.get('kind') == 'cron' else None
+            if skill:
+                found.append((skill, _codex_schedule_item(automation_id, entry, installed[skill])))
+        return found, complete
+    return None
+
+
+def _scheduled_skill_text(env, schedule_id, entry=None):
+    path = (entry or {}).get('filePath')
+    if not (isinstance(path, str) and os.path.basename(path) == 'SKILL.md'):
+        path = os.path.join(_scheduled_tasks_dir(env), schedule_id, 'SKILL.md')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return handle.read(MAX_FILE_BYTES)
+    except (OSError, UnicodeDecodeError):
+        return ''
+
+
+def _schedule_skill(text, installed):
+    """The added task Skill a scheduled prompt loads: by name, or by the task name it falls back to."""
+    for name in _SKILL_REF.findall(text or ''):
+        if name in installed:
+            return name
+    for task_name in _TASK_NAME_REF.findall(text or ''):
+        for name, config in installed.items():
+            if (config.get('task_name') or '') == task_name:
+                return name
+    return None
+
+
+def local_time_zone_name(env=None):
+    """This computer's IANA time zone (`Asia/Shanghai`), which desktop cron expressions are read in; None if unknown."""
+    zone = str((env or os.environ).get('TZ') or '').lstrip(':')
+    if _ZONE_NAME.fullmatch(zone):
+        return zone
+    try:
+        target = os.path.realpath('/etc/localtime')
+    except OSError:
+        return None
+    zone = target.split('zoneinfo/', 1)[1] if 'zoneinfo/' in target else ''
+    return zone if _ZONE_NAME.fullmatch(zone) else None
+
+
+def _schedule_item(schedule_id, entry, config, tool_input=None):
+    """One schedule as ConsoleX stores it, from the desktop app's state entry, else from the tool call that made it."""
+    item = {'schedule_id': schedule_id, 'task_uuid': config.get('task_uuid'), 'timezone': local_time_zone_name()}
+    if isinstance(entry, dict):
+        item.update(cron=entry.get('cronExpression') or None, fire_at=entry.get('fireAt') or None,
+                    enabled=entry.get('enabled') is not False, permission_mode=entry.get('permissionMode') or None,
+                    last_run_at=entry.get('lastRunAt') or None)
+    elif isinstance(tool_input, dict):
+        for source, target in (('cronExpression', 'cron'), ('fireAt', 'fire_at')):
+            if source in tool_input:
+                item[target] = tool_input.get(source) or None
+        if isinstance(tool_input.get('enabled'), bool):
+            item['enabled'] = tool_input['enabled']
+    return item
+
+
+def _report_schedules(config, env, items, complete, http):
+    token = _token(config, env)
+    if not token:
+        return 0, {}
+    return http('PUT', _api(config, env) + '/api/operator/external/schedules', token,
+                {'complete': bool(complete), 'schedules': items}, timeout=QUICK_TIMEOUT)
+
+
+def _reconcile(env, http):
+    """{api: (status, body)} after telling each ConsoleX server every scheduled task on this computer that runs one of
+    its added tasks; None when the desktop app's schedules could not be read (then nothing is sent)."""
+    installed = {name: config for name, config in _installed_task_list(env) if not _outdated(config)}
+    local = _local_schedule_items(env, installed)
+    if local is None:
+        return None
+    found, complete = local
+    batches = {}  # api -> (a config of that server, [items])
+    for config in installed.values():
+        batches.setdefault(_api(config, env), (config, []))
+    for skill, item in found:
+        batches[_api(installed[skill], env)][1].append(item)
+    results = {}
+    for api, (config, items) in batches.items():
+        # Over the cap, or with a file that could not be read, the list is not complete: it must not delete anything.
+        results[api] = _report_schedules(config, env, items[:MAX_REPORTED_SCHEDULES],
+                                         complete and len(items) <= MAX_REPORTED_SCHEDULES, http)
+    return results
+
+
+def reconcile_schedules(env, http=http_json):
+    """Tell ConsoleX every desktop scheduled task on this computer that runs an added ConsoleX task (the Claude
+    desktop app's in Claude Code, the Codex app's in Codex), as a complete list per ConsoleX server, so schedules
+    paused, changed or deleted in the app are caught. Returns {api: status}, or None when the desktop app's schedules
+    could not be read (then nothing is sent, so nothing is marked deleted)."""
+    fingerprint = schedule_fingerprint(env)  # taken first: a change made while this runs is synced next time
+    results = _reconcile(env, http)
+    if results is None or all(0 < status < 500 for status, _ in results.values()):
+        _mark_schedules_synced(env, fingerprint)  # ConsoleX answered, or there was nothing it could be told
+    return None if results is None else {api: status for api, (status, _) in results.items()}
+
+
+def _spawn_schedule_reconcile(env):
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), 'schedules'], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                         env={**os.environ, **{key: value for key, value in env.items() if key.startswith('CONSOLEX_')}})
+        return True
+    except OSError:
+        return False
+
+
+SCHEDULE_SYNC_RETRY_SECONDS = 300  # a sync started for the same change (still running, or failed) is not restarted sooner
+
+
+def _schedule_sources(env):
+    """Where this runtime's desktop app keeps its schedules: the Claude desktop app's state file and the scheduled
+    tasks' prompts, or the Codex app's automations (with their folders, which change when one is added or deleted)."""
+    if client(env) == 'claude_code':
+        root = _scheduled_tasks_dir(env)
+        return _desktop_state_paths(env) + [root] + glob.glob(os.path.join(root, '*', 'SKILL.md'))
+    if client(env) == 'codex':
+        root = _codex_automations_dir(env)
+        return [root] + glob.glob(os.path.join(root, '*', 'automation.toml'))
+    return []
+
+
+def schedule_fingerprint(env):
+    """The size and modification time of those files, hashed; '' when none exists. Nothing is read, so it is cheap
+    enough for every prompt, and it changes when the owner adds, edits, pauses or deletes a schedule in the app."""
+    parts = []
+    for path in sorted(set(_schedule_sources(env))):
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        parts.append('%s %s %s' % (path, info.st_size, info.st_mtime_ns))
+    return hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest() if parts else ''
+
+
+def _schedule_sync_path(env):
+    return os.path.join(consolex_home(env), 'schedules-sync.json')
+
+
+def _schedule_sync_state(env):
+    state = _read_json(_schedule_sync_path(env), {})
+    state = state if isinstance(state, dict) else {}
+    return state, state.get(client(env)) if isinstance(state.get(client(env)), dict) else {}
+
+
+def _mark_schedules_synced(env, fingerprint):
+    state, mine = _schedule_sync_state(env)
+    state[client(env)] = dict(mine, synced=fingerprint)
+    _write_private(_schedule_sync_path(env), state)
+
+
+def sync_schedules_if_changed(env, force=False):
+    """Start a background sync of this computer's schedules to ConsoleX when the desktop app's schedule files changed
+    since the last sync that went through: a schedule edited, paused or deleted in the app's own window (no hook sees
+    that) reaches ConsoleX at the owner's next prompt or session. `force` when a scheduled run starts. Returns whether
+    a sync started."""
+    if client(env) not in ('claude_code', 'codex') or not _installed_skills(env):
+        return False
+    fingerprint = schedule_fingerprint(env)
+    state, mine = _schedule_sync_state(env)
+    if not force:
+        if not fingerprint or fingerprint == mine.get('synced'):
+            return False
+        if fingerprint == mine.get('tried') and time.time() - float(mine.get('tried_at') or 0) < SCHEDULE_SYNC_RETRY_SECONDS:
+            return False
+    state[client(env)] = dict(mine, tried=fingerprint, tried_at=time.time())
+    _write_private(_schedule_sync_path(env), state)
+    return bool(_spawn_schedule_reconcile(env))
+
+
+def _tool_failed(response):
+    if isinstance(response, dict):
+        return bool(response.get('is_error') or response.get('isError'))
+    text = response if isinstance(response, str) else ''
+    return text.lstrip().lower().startswith('error')
+
+
+# Which desktop app runs a local schedule, by the runtime ConsoleX names for its computer (older servers name none:
+# only Claude Code reported schedules then).
+_SCHEDULER_APPS = {'claude_code': 'Claude desktop', 'codex': 'Codex app'}
+
+
+def _where_it_runs(hosted, others):
+    where = []
+    if hosted:
+        where.append('a schedule in ConsoleX itself (%s%s)' % (hosted.get('schedule') or '?', (
+            ', %s' % hosted['timezone']) if hosted.get('timezone') else ''))
+    for other in others:
+        when = other.get('cron') or other.get('fire_at') or 'a time set there'
+        where.append('a %s schedule on %s (%s%s)' % (
+            _SCHEDULER_APPS.get(other.get('runtime'), 'Claude desktop'), other.get('device_name') or 'another computer',
+            when, (', %s' % other['timezone']) if other.get('timezone') else ''))
+    return ' and '.join(where)
+
+
+def _how_to_stop(hosted, others):
+    how = []
+    if hosted:
+        how.append("in ConsoleX, open the task's Settings and switch When to one-time, or pause it")
+    if others:
+        apps = sorted({_SCHEDULER_APPS.get(other.get('runtime'), 'Claude desktop') for other in others})
+        places = ' or '.join({'Claude desktop': "the Claude desktop app's Scheduled tasks",
+                              'Codex app': "the Codex app's Scheduled view"}[app] for app in apps)
+        how.append("on that computer, pause or delete it in %s, or ask the agent there to stop it; if that computer no "
+                   "longer runs it, the task's page in ConsoleX can release it" % places)
+    return '; '.join(how)
+
+
+def on_schedule_changed(data, env, http=http_json):
+    """PostToolUse of the desktop app's create/update/delete_scheduled_task: when that scheduled task runs an added
+    ConsoleX task, tell ConsoleX at once, and tell Claude if the task now also runs from somewhere else."""
+    if client(env) != 'claude_code':
+        return None
+    tool_input = data.get('tool_input') or {}
+    schedule_id = str(tool_input.get('taskId') or '').strip()
+    if not _SCHEDULE_ID.fullmatch(schedule_id) or _tool_failed(data.get('tool_response')):
+        return None
+    installed = {name: config for name, config in _installed_task_list(env) if not _outdated(config)}
+    state = read_desktop_schedules(env)
+    entry = (state or {}).get(schedule_id)
+    deleted = data.get('tool_name', '').endswith('delete_scheduled_task')
+    if state is not None and entry is None and not deleted:
+        return None  # The call did not leave such a task (refused, or another id).
+    # A deleted task keeps its SKILL.md, so even then it says which ConsoleX task it ran.
+    skill = _schedule_skill(_scheduled_skill_text(env, schedule_id, entry), installed)
+    if not skill:
+        return None
+    config = installed[skill]
+    item = {'schedule_id': schedule_id, 'deleted': True} if deleted else _schedule_item(schedule_id, entry, config, tool_input)
+    status, body = _report_schedules(config, env, [item], False, http)
+    if status != 200 or not body.get('succ'):
+        return None
+    for conflict in body.get('conflicts') or []:
+        if isinstance(conflict, dict) and conflict.get('task_uuid') == config.get('task_uuid'):
+            hosted, others = conflict.get('hosted'), [o for o in conflict.get('other_computers') or [] if isinstance(o, dict)]
+            return _context(data, (
+                'ConsoleX: the ConsoleX task "%s" also runs from %s, so it would now be done and published twice. Tell '
+                'the user, and that a task should run from one place: either delete or pause the scheduled task just '
+                'set up here (if they say so), or turn the other one off (%s).') % (
+                config.get('task_name') or skill, _where_it_runs(hosted, others), _how_to_stop(hosted, others)))
+    return None
+
+
+def is_codex_schedule_tool(name):
+    """The Codex app's automation tool, as the hook names it (`mcp__codex_app__automation_update`)."""
+    return str(name or '').rsplit('__', 1)[-1] == 'automation_update'
+
+
+def on_codex_schedule_changed(data, env, http=http_json):
+    """PostToolUse of the Codex app's automation_update: when the agent creates, changes or deletes an automation,
+    ConsoleX hears this computer's complete list at once (the app's files already show the change), and the agent
+    hears if the task now also runs from somewhere else. A suggestion the user still has to accept, or a view, changes
+    nothing yet; the hourly refresh catches whatever is accepted later."""
+    if client(env) != 'codex':
+        return None
+    tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+    mode = str(tool_input.get('mode') or '')
+    if mode not in ('create', 'update', 'delete') or _tool_failed(data.get('tool_response')):
+        return None
+    installed = {name: config for name, config in _installed_task_list(env) if not _outdated(config)}
+    automations, _ = read_codex_automations(env)
+    entry = (automations or {}).get(str(tool_input.get('id') or ''), {})
+    skill = _schedule_skill(str(tool_input.get('prompt') or entry.get('prompt') or ''), installed)
+    if mode == 'delete' or not skill:
+        if mode == 'delete':
+            _spawn_schedule_reconcile(env)  # it may have run a ConsoleX task; its folder is gone, so only the list says
+        return None
+    config = installed[skill]
+    status, body = (_reconcile(env, http) or {}).get(_api(config, env), (0, {}))
+    if status != 200 or not isinstance(body, dict) or not body.get('succ'):
+        return None
+    for conflict in body.get('conflicts') or []:
+        if isinstance(conflict, dict) and conflict.get('task_uuid') == config.get('task_uuid'):
+            hosted, others = conflict.get('hosted'), [o for o in conflict.get('other_computers') or [] if isinstance(o, dict)]
+            return _context(data, (
+                'ConsoleX: the ConsoleX task "%s" also runs from %s, so it would now be done and published twice. Tell '
+                'the user, and that a task should run from one place: either pause or delete the scheduled task just '
+                'set up here (if they say so), or turn the other one off (%s).') % (
+                config.get('task_name') or skill, _where_it_runs(hosted, others), _how_to_stop(hosted, others)))
+    return None
+
+
+def _schedule_gate(env, config, http):
+    """('block' | 'warn' | '', text): whether ConsoleX says the task already runs from somewhere else.
+
+    A hosted schedule that is on, or a recent schedule on another of the owner's computers, blocks: a task runs from
+    one place. One ConsoleX has not heard about for a while only warns, so a lost computer cannot lock the task.
+    Several schedules on this computer are fine. Not connected blocks (the runs could not be checked either);
+    ConsoleX unreachable or too old to say only warns."""
+    token = _token(config, env)
+    status, body = http('GET', _task_url(config, env, 'schedules'), token, timeout=QUICK_TIMEOUT) if token else (401, {})
+    if status == 401:
+        return 'block', ('ConsoleX is not connected on this computer (%s), so it cannot say whether this task already '
+                         'runs elsewhere, and scheduled runs would not be checked. Tell the user to run /consolex:login '
+                         'first, then set the schedule again.' % _api(config, env))
+    if status != 200 or not body.get('succ'):
+        return 'warn', ('ConsoleX could not say whether this task already runs on a schedule elsewhere (%s). If it also '
+                        'has a schedule in ConsoleX or on another computer, it would run twice.') % (
+            body.get('error_msg') or ('HTTP %s' % status if status else 'unreachable'))
+    hosted = body.get('hosted') if isinstance(body.get('hosted'), dict) else None
+    others = [other for other in body.get('other_computers') or [] if isinstance(other, dict)]
+    recent, stale = [o for o in others if not o.get('stale')], [o for o in others if o.get('stale')]
+    if hosted or recent:
+        return 'block', ('It already runs from %s. A task runs from one place, so it is never done or published twice. '
+                         'Tell the user in a few lines where it runs now, and how to turn that off first: %s. Once it is '
+                         'off, they can ask for this schedule again.') % (_where_it_runs(hosted, recent),
+                                                                          _how_to_stop(hosted, recent))
+    if stale:
+        return 'warn', ('ConsoleX has not heard for over %s days from %s. If that computer still runs it, the task '
+                        'would run twice; if it no longer does, the task\'s page in ConsoleX can release it.') % (
+            body.get('stale_after_days') or 4, _where_it_runs(None, stale))
+    return '', ''
+
+
+def _started_root(env):
+    """Where `/consolex:start` keeps the tasks it loads: private to the client, not one of the agent's Skill folders."""
+    return os.path.join(consolex_home(env), 'started')
+
+
+def _started_skill_dir(env, name):
+    candidate = os.path.join(_started_root(env), name)
+    return candidate if os.path.isfile(os.path.join(candidate, 'consolex.json')) else None
+
+
+MAX_START_LOOKUPS = 10
+_TASK_LINK = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
+
+
+def _find_task_to_start(env, api_base, token, argument, http):
+    """(tasks, request, status, body) for `/consolex:start`'s argument.
+
+    `<task> -- <request>` splits at the dashes, and a ConsoleX link ends the task part. Otherwise the longest run of
+    leading words that still finds a task names it and the rest is this time's request
+    (`/consolex:start weekly note focus on churn`): every word must be in the name, so a longer run only narrows."""
+    head, dashes, tail = argument.partition(' -- ')
+    words, extra = head.split(), [tail.strip()] if tail.strip() else []
+    link = next((index for index, word in enumerate(words) if _TASK_LINK.search(word)), None)
+    if link is not None:
+        words, extra = words[:link + 1], words[link + 1:] + extra
+    status, body = _list_tasks(env, api_base, token, ' '.join(words), http)
+    if status != 200 or body.get('tasks') or dashes or link is not None or len(words) < 2:
+        return body.get('tasks') or [], ' '.join(extra), status, body
+    found = None  # (count, tasks) of the longest leading run with a match
+    for count in range(1, min(len(words), MAX_START_LOOKUPS)):
+        status, body = _list_tasks(env, api_base, token, ' '.join(words[:count]), http)
+        if status != 200 or not body.get('tasks'):
+            break
+        found = (count, body['tasks'])
+    if status != 200 and not found:
+        return [], '', status, body
+    if not found:
+        return [], '', 200, body
+    return found[1], ' '.join(words[found[0]:] + extra), 200, body
+
+
+def start_task(data, env, argument, http=http_json):
+    """`/consolex:start <task> [-- request]`: do a ConsoleX task in this session without adding it as a Skill.
+
+    The task's Skill and its ConsoleX Skills go to a private folder (`~/.consolex/started/`), not to the agent's
+    Skills, and the session is marked with it exactly as when an added task Skill loads, so the method, the task's
+    ConsoleX tools and the delivery check all work the same. A task that is already added uses its added Skill."""
+    # Return the task separately so native command hosts can start work without parsing the context text.
+    api_base = default_api_base(env)
+    token, _ = connection_for(env, api_base)
+    if not token:
+        return _not_connected(data, api_base), None
+    if not argument.strip():
+        return _context(data, 'Tell the user to name the task: /consolex:start followed by words from its name or its '
+                              'ConsoleX link (/consolex:add with no words lists them). Do not run anything.'), None
+    tasks, request, status, body = _find_task_to_start(env, api_base, token, argument, http)
+    if status == 401:
+        return _not_connected(data, api_base), None
+    if status != 200:
+        return _context(data, 'ConsoleX could not find tasks (%s). Tell the user.' % (body.get('error_msg') or 'HTTP %s' % status)), None
+    if not tasks:
+        return _context(data, 'No ConsoleX task matches "%s". Tell the user; /consolex:add with no words lists all tasks, and a request '
+                              'for this time goes after the task name and " -- " (/consolex:start weekly note -- focus on '
+                              'churn). Do not run anything.' % argument.strip()), None
+    if len(tasks) > 1:
+        return _context(data, ('Several ConsoleX tasks match:\n%s\n\nAsk the user which one, then they run /consolex:start '
+                               'with more words of its name. Do not run anything.') % _task_lines(tasks[:10], _installed_skills(env))), None
+    task = tasks[0]
+    added = _installed_skills(env).get(task['uuid'])
+    if added:
+        task_env, skill_dir = env, os.path.join(skills_dir(env), added)
+        where = 'It is also added here as /%s, so its Skills load as usual.' % added
+    else:
+        status, bundle = http('GET', api_base + '/api/operator/external/tasks/%s/skill' % task['uuid'], token, timeout=QUICK_TIMEOUT)
+        if status != 200 or not bundle.get('succ'):
+            return _context(data, 'ConsoleX could not load "%s" (%s). Tell the user.' % (
+                task['name'], bundle.get('error_msg') or 'HTTP %s' % status)), None
+        task_env = {**env, 'CONSOLEX_SKILLS_DIR': _started_root(env)}
+        _, skill_dir = install_skill(task_env, bundle)
+        install_task_skills(task_env, api_base, token, task['uuid'], bundle.get('skills') or [], http=http)
+        where = 'It is not added as a Skill here; everything it needs is below.'
+    # Marks the session (so the delivery is checked), fetches the latest approved method, syncs the task's
+    # ConsoleX Skills and names its ConsoleX tools.
+    activated = activate(data, task_env, skill_dir, http=http)
+    note = ((activated or {}).get('hookSpecificOutput') or {}).get('additionalContext') or ''
+    skill_text = re.sub(r'\A---[ \t]*\r?\n.*?\r?\n---[ \t]*\r?\n', '', _read_text(os.path.join(skill_dir, 'SKILL.md')) or '',
+                        count=1, flags=re.S)
+    if not added:
+        skill_text = _SKILLS_SECTION.sub('', skill_text).rstrip('\n') + '\n'
+        skills = sorted(name for name in os.listdir(_started_root(env))
+                        if os.path.isfile(os.path.join(_started_root(env), name, SKILL_MANIFEST)) and task['uuid'] in
+                        (_read_json(os.path.join(_started_root(env), name, SKILL_MANIFEST), {}).get('tasks') or []))
+        if skills:
+            skill_text += ('\n## Skills for this task\n\nThis task uses these Skills. They are not added to your Skills, so '
+                           'when a step needs one, read its SKILL.md with your file tools and follow it:\n%s\n') % '\n'.join(
+                '- %s: %s' % (name, os.path.join(_started_root(env), name, 'SKILL.md')) for name in skills)
+    return _context(data, (
+        'The user started the ConsoleX task "%s" in this session with /consolex:start. %s Do it now, following the '
+        "task's Skill below. When you deliver, ConsoleX checks the delivery against the task's saved standard, as with "
+        "an added task.%s\n\n<task-skill>\n%s</task-skill>\n\n%s") % (
+        task['name'], where, ("\n\nThe user's request this time: %s" % request) if request else
+        ' The user gave no extra request this time: do the task as saved, and ask only what its method says to ask.',
+        skill_text, note)), task
+
+
+def on_start(data, env, argument, http=http_json):
+    return start_task(data, env, argument, http=http)[0]
+
+
+def on_remove(data, env, argument, http=http_json):
+    """`/consolex:remove <task>`: take an added task off this computer: its task Skill, and the ConsoleX Skills installed
+    with it that no other added task uses (a Skill the client did not install is never touched). The task stays in
+    ConsoleX, so /consolex:add brings it back. While a Claude desktop scheduled task that is on still runs it, nothing
+    is removed: "delete the schedule" is easily taken for this command, and the scheduled run would fail without the
+    Skill, so the owner says first whether they meant only the schedule. Paused ones (or all of them, when the desktop
+    app's state cannot be read) are listed after the removal, not deleted."""
+    installed = _installed_task_list(env)
+    if not installed:
+        return _context(data, 'No ConsoleX task is added on this computer, so there is nothing to remove. Tell the user '
+                              'in one line.')
+    words = argument.strip()
+    matches = _match_installed_task(installed, words)
+    if len(matches) != 1:
+        listing = '\n'.join('- /%s — %s' % (name, config.get('task_name') or name) for name, config in installed)
+        return _context(data, ('%s Tasks added on this computer:\n%s\n\nShow this list and ask the user which one to '
+                               'remove. Remove nothing yet.') % (
+            'Several added tasks match "%s".' % words if matches else
+            'No added task matches "%s".' % words if words else 'Say which task to remove.', listing))
+    skill, config = matches[0]
+    name = config.get('task_name') or skill
+    scheduler = _SCHEDULER_TOOLS.get(client(env))
+    runs = _scheduled_runs_of(env, skill) if scheduler else []
+    on = [run['taskId'] for run in runs if run['enabled']]
+    if on:
+        return _context(data, (
+            'Removed nothing: %s still run the ConsoleX task "%s" (%s), and they would fail without its Skill. Ask the '
+            'user which they want: only stop the schedule (delete those scheduled tasks with %s, or pause them with %s, '
+            'and keep the task), or also take the task off this computer (delete those scheduled tasks, then run '
+            '/consolex:remove /%s again). Do neither until they answer.') % (
+            scheduler['tasks'], name, ', '.join('"%s"' % task_id for task_id in on), scheduler['delete'],
+            scheduler['pause'], skill))
+    root, task_uuid = skills_dir(env), config.get('task_uuid')
+    removed, kept = [], []
+    for folder, manifest in _installed_task_skills(env).values():
+        users = manifest.get('tasks') or []
+        if task_uuid not in users:
+            continue
+        others = [uuid for uuid in users if uuid != task_uuid]
+        if others:
+            _write_private(os.path.join(root, folder, SKILL_MANIFEST), dict(manifest, tasks=others))
+            kept.append(folder)
+        else:
+            shutil.rmtree(os.path.join(root, folder), ignore_errors=True)
+            removed.append(folder)
+    marker = load_marker(env, data.get('session_id'))
+    if marker and os.path.realpath(marker.get('skill_dir') or '') == os.path.realpath(os.path.join(root, skill)):
+        on_session_end(data, env, http=http)  # This session was doing the task: its checks stop with it.
+        clear_marker(env, data.get('session_id'))
+    shutil.rmtree(os.path.join(root, skill), ignore_errors=True)
+    text = 'Removed the ConsoleX task "%s" from this computer: its Skill /%s' % (name, skill)
+    if removed:
+        text += ', and the ConsoleX Skills installed only for it (%s)' % ', '.join(removed)
+    text += '.'
+    if kept:
+        text += ' Kept %s, which another added task still uses.' % ', '.join(kept)
+    text += (' The task itself stays in ConsoleX; /consolex:add followed by words from its name brings it back. Tell '
+             'the user in one or two lines.')
+    if runs:
+        text += (' These %s load it and would fail without its Skill: %s. Ask the user whether to delete them (%s), and '
+                 'delete only the ones they agree to.') % (
+            scheduler['tasks'], ', '.join('"%s"' % run['taskId'] for run in runs), scheduler['delete'])
+    return _context(data, text)
+
+
+# The scheduled tasks each runtime's desktop app keeps, and the agent's tools that pause or delete one.
+_SCHEDULER_TOOLS = {
+    'claude_code': {'tasks': 'Claude desktop scheduled tasks', 'delete': 'delete_scheduled_task',
+                    'pause': 'update_scheduled_task and enabled false'},
+    'codex': {'tasks': 'scheduled tasks in the Codex app', 'delete': 'automation_update and mode delete',
+              'pause': 'automation_update, mode update and status PAUSED'},
+}
+
+COMMANDS = {'consolex:login': on_login, 'consolex:logout': on_logout, 'consolex:status': on_status,
+            'consolex:tasks': on_tasks, 'consolex:add': on_add, 'consolex:start': on_start,
+            'consolex:check': on_check_command, 'consolex:save': on_save, 'consolex:run': on_run_command,
+            'consolex:remove': on_remove}
+# Commands of the runtimes whose desktop app runs scheduled tasks: Claude Code (the Claude desktop app) and Codex (the
+# Codex app). DeepSeek Harness has no scheduler.
+SCHEDULE_COMMANDS = {'consolex:schedule': on_schedule}
+SCHEDULE_CLIENTS = ('claude_code', 'codex')
+# Commands only the user starts: they disconnect the computer, or send the session's own content to ConsoleX. Their
+# Claude Code command files also say `disable-model-invocation: true`; this holds if a client ignores that.
+USER_ONLY_COMMANDS = {'consolex:logout', 'consolex:save'}
+
+
+def _command_handler(name, env):
+    return COMMANDS.get(name) or (SCHEDULE_COMMANDS.get(name) if client(env) in SCHEDULE_CLIENTS else None)
+
+
+def native_text(text, runtime):
+    """`text` in the words and command syntax of `runtime` (Codex `$consolex-add`, DSH `/consolex add`)."""
+    if runtime not in ('codex', 'deepseek_harness'):
+        return text
+    names = '|'.join(name.split(':', 1)[1] for name in list(COMMANDS) + list(SCHEDULE_COMMANDS))
+    # "Claude desktop" names the app that runs a schedule on another computer, so it stays.
+    text = re.sub(r'\bClaude\b(?! desktop)', 'the agent', text.replace('Claude Code', RUNTIME_LABELS[runtime]))
+    if runtime == 'codex':
+        text = re.sub(r'/consolex:(%s)' % names, r'$consolex-\1', text)
+        text = re.sub(r'/cx-', '$cx-', text)
+        # Available only in some Codex collaboration modes; the text fallback is required.
+        return text.replace('AskUserQuestion', 'request_user_input')
+    text = re.sub(r'/consolex:(%s)' % names, r'/consolex \1', text)
+    return text.replace('AskUserQuestion', 'ask_user_question')
+
+
+# The commands an agent may run for the user through the consolex_command tool when they ask in plain words (Codex's
+# MCP server, DSH's native tools). Claude Code runs the command Skill itself instead (see handle). Never logout or save
+# (USER_ONLY_COMMANDS); not start or check either, which belong to a session: an added task starts with its Skill.
+COMMAND_TOOL = 'consolex_command'
+AGENT_COMMANDS = ('login', 'status', 'tasks', 'add', 'remove', 'run')
+
+
+def command_for_agent(env, command, arguments='', session_id='', cwd=None, http=http_json):
+    """(text, is_error): the ConsoleX command `command` (`add`, `$consolex-add`, `/consolex:add` …) run for the user,
+    with the same result as when they type it, in the runtime's own command syntax."""
+    name = re.sub(r'^(?:consolex[:-]|consolex\s+)', '', str(command or '').strip().lstrip('/$').strip())
+    if name not in AGENT_COMMANDS:
+        if 'consolex:' + name in USER_ONLY_COMMANDS:
+            text = 'Only the user can run /consolex:%s. Tell them to type it themselves; do nothing else.' % name
+        else:
+            text = 'Give command as one of: %s.' % ', '.join(AGENT_COMMANDS)
+        return native_text(text, client(env)), True
+    data = {'hook_event_name': 'ConsoleXCommand', 'session_id': str(session_id or ''), 'cwd': cwd or os.getcwd()}
+    output = COMMANDS['consolex:' + name](data, env, str(arguments or ''), http=http) or {}
+    text = (output.get('hookSpecificOutput') or {}).get('additionalContext') or output.get('systemMessage') or ''
+    return native_text(text or 'ConsoleX: no result.', client(env)), False
 
 
 def handle(data, env, http=http_json):
@@ -2152,15 +3602,43 @@ def handle(data, env, http=http_json):
         return output
     if event == 'UserPromptSubmit':
         heartbeat(data, env, http=http)
+        marker, _ = _session_config(env, data)
+        if marker:
+            marker['prompt_at'] = time.time()  # work on the next delivery starts with this message
+            # Each prompt says whether someone is there: a scheduled run's prompt, or the owner coming back to it.
+            marker['unattended'] = unattended(data, env, marker)
+            marker['schedule_id'] = scheduled_task_id(data) or marker.get('schedule_id')
+            save_marker(env, marker)
+        if client(env) == 'claude_code':
+            # A scheduled run starts, or a schedule changed in the desktop app since the last sync: ConsoleX hears
+            # what this computer's schedules are (in the background).
+            sync_schedules_if_changed(env, force=bool(SCHEDULED_PROMPT.match(data.get('prompt') or '')))
     if data.get('tool_name') == 'AskUserQuestion':
         # The owner is asked something (PreToolUse) or has answered (PostToolUse).
         if event == 'PreToolUse':
+            marker, config = _session_config(env, data)
+            if marker and unattended(data, env, marker):
+                # Nobody would answer: the question would hold the run until the owner happens to look.
+                return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                                               'permissionDecisionReason': ASK_DENIED[0 if _zh(config) else 1]}}
             session_state(data, env, 'ask', http=http)
         elif event == 'PostToolUse':
             heartbeat(data, env, http=http)
+            note_owner_answer(data, env)
         return None
+    if event == 'PostToolUse' and data.get('tool_name') in SCHEDULE_TOOLS:
+        return on_schedule_changed(data, env, http=http)
     if event == 'PostToolUse':
-        skill = ((data.get('tool_input') or {}).get('skill') or '').strip()
+        tool_input = data.get('tool_input') or {}
+        skill = str(tool_input.get('skill') or '').strip().lstrip('/')
+        handler = _command_handler(skill, env)
+        if handler:
+            # Claude ran a /consolex:… command for the user (they asked in plain words), so the prompt hook never saw
+            # it: it is answered here, the same as when the user types it.
+            if skill in USER_ONLY_COMMANDS:
+                return _context(data, 'Only the user can run /%s. Tell them to type it themselves; do nothing else.' %
+                                skill)
+            return handler(data, env, str(tool_input.get('args') or ''), http=http)
         skill_dir = find_skill_dir(skill, env, cwd)
         return activate(data, env, skill_dir, http=http) if skill_dir else None
     if event == 'UserPromptSubmit':
@@ -2168,7 +3646,7 @@ def handle(data, env, http=http_json):
         if not prompt.startswith('/'):
             return None
         command, _, argument = prompt[1:].partition(' ')
-        handler = COMMANDS.get(command)
+        handler = _command_handler(command, env)
         if handler:
             return handler(data, env, argument, http=http)
         skill_dir = find_skill_dir(command, env, cwd)
@@ -2202,7 +3680,10 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'refresh':
         refresh_installed_tasks(dict(os.environ))
         sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == 'schedules':
+        reconcile_schedules(dict(os.environ))
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == 'run':
         sys.exit(run_main(sys.argv[2:]))
-    sys.stderr.write('usage: consolex.py hook|poll|refresh|run  (hooks read the hook JSON on stdin; run <task words> starts an isolated run)\n')
+    sys.stderr.write('usage: consolex.py hook|poll|refresh|schedules|run  (hooks read the hook JSON on stdin; run <task words> starts an isolated run)\n')
     sys.exit(2)

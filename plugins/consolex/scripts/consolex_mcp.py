@@ -4,9 +4,13 @@
 Two modes:
 - An isolated run (`consolex.py run`) starts it for one task (`CONSOLEX_TASK_UUID`): it lists that task's tools
   under their own names and forwards every call.
-- Otherwise (an ordinary session, registered by the plugin) it offers two tools: `consolex_task_tools` lists the
+- Otherwise (an ordinary session, registered by the plugin) it offers three tools: `consolex_task_tools` lists the
   tools of an installed task Skill and `consolex_run_task_tool` runs one. The task is named by its Skill (cx-…),
-  which the plugin's note gives when the task starts.
+  which the plugin's note gives when the task starts. `consolex_rename_skill` renames an added task Skill: the
+  agent gives a task with a Chinese (or other non-Latin) name an English Skill name right after /consolex:add.
+  In Claude Code it also offers `consolex_schedule`, which gives what /consolex:schedule gives (the fixed prompt of a
+  Claude desktop scheduled run and the scheduled tasks that already run the task), so a schedule asked for in plain
+  words, or a /consolex:schedule that Claude started itself (no hook runs then), comes out the same.
 
 ConsoleX runs each call with the owner's keys and connections, bills it like a hosted run and records it. Keys,
 OAuth tokens and Skill secrets never reach this computer; the device token is read from the shared ConsoleX
@@ -45,7 +49,62 @@ GATEWAY_TOOLS = [
          'tool': {'type': 'string', 'description': 'The tool name from %s.' % core.TASK_TOOLS_TOOL},
          'arguments': {'type': 'object', 'description': "The tool's arguments, as its input schema describes."}},
          'required': ['task', 'tool']}},
+    {'name': core.RENAME_SKILL_TOOL,
+     'description': 'Rename a ConsoleX task Skill added on this computer (cx-…). Use it when the ConsoleX plugin asks you '
+                    'to give an added task an English Skill name, or when the user asks to rename one. Later updates '
+                    'of the task keep the new name.',
+     'inputSchema': {'type': 'object', 'properties': {
+         'skill': {'type': 'string', 'description': 'The current Skill name, like "cx-task-8601".'},
+         'name': {'type': 'string', 'description': 'The new name: 2 to 4 lowercase English words joined by hyphens, '
+                                                   'starting with cx-, like "cx-weekly-client-report".'}},
+         'required': ['skill', 'name']}},
 ]
+# Claude Code only: a schedule is a Claude desktop scheduled task.
+SCHEDULE_TOOL = {
+    'name': core.SCHEDULE_TOOL,
+    'description': 'Set up or change a scheduled run of a ConsoleX task added on this computer, in the Claude desktop '
+                   'app. Use it whenever the user wants a ConsoleX task to run by itself at set times, or to change, add, '
+                   'pause or stop such a schedule, with or without /consolex:schedule ("run 小语评球 every weekday at '
+                   '8:30"). It returns the scheduled tasks that already run the task and the exact taskId, title, '
+                   'description and prompt to pass to the scheduled-tasks tools: you only turn the time into a cron '
+                   'expression. Never write such a prompt yourself.',
+    'inputSchema': {'type': 'object', 'properties': {
+        'task': {'type': 'string', 'description': 'Which added task: words from its name (like "小语评球"), its cx- Skill '
+                                                  'name, or its ConsoleX task link. Leave the time out.'},
+        'notes': {'type': 'string', 'description': 'Only if the user named them: places on this computer the runs should '
+                                                   'know (notes to read, earlier output folders, scripts to reuse). Never '
+                                                   'rules about the work.'}},
+        'required': ['task']}}
+# Codex: a schedule is a scheduled task in the Codex app (its automation_update tool). The MCP server is not started
+# in the chat's folder, so the agent names it.
+CODEX_SCHEDULE_TOOL = {
+    'name': core.SCHEDULE_TOOL,
+    'description': 'Set up or change a scheduled run of a ConsoleX task added on this computer, as a scheduled task in '
+                   'the Codex app. Use it whenever the user wants a ConsoleX task to run by itself at set times, or to '
+                   'change, add, pause or stop such a schedule, with or without $consolex-schedule ("run 小语评球 every '
+                   'weekday at 8:30"). It returns the scheduled tasks that already run the task and the exact name and '
+                   'prompt to pass to the Codex app\'s automation_update tool: you only turn the time into an RRULE. '
+                   'Never write such a prompt yourself.',
+    'inputSchema': {'type': 'object', 'properties': {
+        'task': SCHEDULE_TOOL['inputSchema']['properties']['task'],
+        'folder': {'type': 'string', 'description': 'The absolute path of the folder this chat works in: the scheduled '
+                                                    'runs work there.'},
+        'notes': SCHEDULE_TOOL['inputSchema']['properties']['notes']},
+        'required': ['task', 'folder']}}
+# Codex (and any runtime but Claude Code, which runs the command Skill itself): the commands a user asks for in plain
+# words. The same text in DSH's native tool (integrations/deepseek_harness/index.mjs).
+COMMAND_TOOL = {
+    'name': core.COMMAND_TOOL,
+    'description': 'Run a ConsoleX command for the user when they ask for it in plain words, with the same result as '
+                   'typing it: login (connect this computer), status, tasks (list or search their ConsoleX tasks), add '
+                   '(add a task here as a cx- Skill), remove (take an added task off this computer only; it stays in '
+                   'ConsoleX; not for stopping a schedule), run (print the terminal command of an isolated run). '
+                   'Logout and save are typed by the user only.',
+    'inputSchema': {'type': 'object', 'properties': {
+        'command': {'type': 'string', 'enum': list(core.AGENT_COMMANDS)},
+        'arguments': {'type': 'string', 'description': 'What follows the command, as the user would type it: words '
+                                                       'from a task name, a ConsoleX task link, or nothing.'}},
+        'required': ['command']}}
 
 
 class ToolServer:
@@ -69,7 +128,12 @@ class ToolServer:
     def list_tools(self):
         if self.gateway:
             # An isolated run has its task's own tools from a task-bound server; the session-wide pair stays out.
-            return [] if self.env.get('CONSOLEX_ISOLATED') == '1' else GATEWAY_TOOLS
+            if self.env.get('CONSOLEX_ISOLATED') == '1':
+                return []
+            runtime = core.client(self.env)
+            if runtime == 'claude_code':
+                return GATEWAY_TOOLS + [SCHEDULE_TOOL]
+            return GATEWAY_TOOLS + ([CODEX_SCHEDULE_TOOL] if runtime == 'codex' else []) + [COMMAND_TOOL]
         if self.tools is not None:
             return self.tools
         self.tools = []
@@ -101,6 +165,23 @@ class ToolServer:
     def _gateway_call(self, name, arguments):
         if name not in {tool['name'] for tool in self.list_tools()}:
             return 'Unknown tool %s.' % name, True
+        if name == core.RENAME_SKILL_TOOL:
+            new, problem = core.rename_task_skill(self.env, arguments.get('skill'), arguments.get('name'))
+            if problem:
+                return problem, True
+            return 'Renamed. The task Skill is now %s%s.' % ('$' if core.client(self.env) == 'codex' else '/', new), False
+        if name == core.COMMAND_TOOL:
+            return core.command_for_agent(self.env, arguments.get('command'), arguments.get('arguments'), self.session_id,
+                                          self.env.get('CLAUDE_PROJECT_DIR') or os.getcwd(), http=self.http)
+        if name == core.SCHEDULE_TOOL:
+            folder = self.env.get('CLAUDE_PROJECT_DIR') or os.getcwd()
+            if core.client(self.env) == 'codex':
+                folder = str(arguments.get('folder') or '').strip()
+                if not (os.path.isabs(folder) and os.path.isdir(folder)):
+                    return 'Give folder: the absolute path of the folder this chat works in.', True
+            text, problem = core.schedule_tool(self.env, arguments.get('task'), arguments.get('notes'), folder,
+                                               http=self.http)
+            return core.native_text(problem or text, core.client(self.env)), bool(problem)
         if name == core.TASK_TOOLS_TOOL:
             tools, problem = core.task_tools(self.env, arguments.get('task'), http=self.http)
             if problem:

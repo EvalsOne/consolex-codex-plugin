@@ -24,7 +24,7 @@ _spec.loader.exec_module(core)
 RUNTIMES = {'codex': 'Codex', 'deepseek_harness': 'DeepSeek Harness'}
 QUESTION_TOOLS = {'request_user_input', 'ask_user_question'}
 CONTROL_TOOLS = QUESTION_TOOLS | {'skill', 'Skill', 'update_plan'}
-COMMAND_NAMES = 'login|logout|tasks|add|check|save|run'
+COMMAND_NAMES = '|'.join(name.split(':', 1)[1] for name in list(core.COMMANDS) + list(core.SCHEDULE_COMMANDS))
 # `/consolex-tasks`: the command Skills in ~/.agents/skills, which DeepSeek Harness lists as slash commands too.
 COMMAND = re.compile(r'^\s*(?:\$(?:consolex:)?consolex-|/consolex[-: ])(%s)\b\s*(.*)' % COMMAND_NAMES, re.S)
 TASK = re.compile(r'(?:\$|/|\b)(cx-[a-z0-9-]{1,70})(?![a-z0-9-])')
@@ -51,16 +51,9 @@ def _context_text(output):
 
 
 def _native_text(text, runtime):
-    text = text.replace('Claude Code', RUNTIMES[runtime]).replace('Claude', 'the agent')
-    if runtime == 'codex':
-        text = re.sub(r'/consolex:(%s)' % COMMAND_NAMES, r'$consolex-\1', text)
-        text = re.sub(r'/cx-', '$cx-', text)
-        # Available only in some Codex collaboration modes; the text fallback is required.
-        text = text.replace('AskUserQuestion', 'request_user_input')
-    else:
-        text = re.sub(r'/consolex:(%s)' % COMMAND_NAMES, r'/consolex \1', text)
-        text = text.replace('AskUserQuestion', 'ask_user_question')
-    return text
+    if runtime not in RUNTIMES:
+        raise ValueError('Unsupported runtime')
+    return core.native_text(text, runtime)  # shared with the Codex MCP server's consolex_command tool
 
 
 def adapt(output, runtime):
@@ -246,6 +239,15 @@ def _save_inputs(env, data):
 def task_tool_event(data, env, http=core.http_json):
     """DSH's native ConsoleX tools: {text, is_error}. The session id records the calls against this conversation,
     so a delivery's check sees them as calls ConsoleX ran itself."""
+    if data.get('hook_event_name') == 'ConsoleXCommand':
+        # The user asked in plain words for a ConsoleX command (add, remove, status …): the same result as typing it.
+        text, is_error = core.command_for_agent(env, data.get('command'), data.get('arguments'), data.get('session_id'),
+                                                data.get('cwd'), http=http)
+        return {'text': text, 'is_error': is_error}
+    if data.get('hook_event_name') == 'ConsoleXRenameSkill':
+        name, problem = core.rename_task_skill(env, data.get('skill'), data.get('name'), data.get('cwd'))
+        return {'text': problem or _native_text('Renamed. The task Skill is now /%s.' % name, env['CONSOLEX_RUNTIME']),
+                'is_error': bool(problem)}
     if data.get('hook_event_name') == 'ConsoleXTaskTools':
         tools, problem = core.task_tools(env, data.get('task'), http=http, cwd=data.get('cwd'))
         if problem:
@@ -260,7 +262,7 @@ def task_tool_event(data, env, http=core.http_json):
 
 def handle(data, env, runtime, http=core.http_json):
     env = environment(env, runtime)
-    if data.get('hook_event_name') in ('ConsoleXTaskTools', 'ConsoleXRunTaskTool'):
+    if data.get('hook_event_name') in ('ConsoleXTaskTools', 'ConsoleXRunTaskTool', 'ConsoleXRenameSkill', 'ConsoleXCommand'):
         return task_tool_event(data, env, http=http)
     data = dict(data)
     data['prompt_id'] = str(data.get('turn_id') or data.get('prompt_id') or 'turn')
@@ -289,7 +291,13 @@ def handle(data, env, runtime, http=core.http_json):
                 marker['owner_answered_at'] = time.time()
                 core.save_marker(env, marker)
             core.heartbeat(data, env, http=http)
-        match = COMMAND.match(prompt)
+        # A Codex app scheduled run: the app puts the automation's name and id above the saved prompt.
+        schedule_id, body = core.codex_automation(prompt)
+        if runtime == 'codex':
+            # A Codex app scheduled run starts, or an automation changed since the last sync: ConsoleX hears this
+            # computer's schedules (in the background).
+            core.sync_schedules_if_changed(env, force=bool(schedule_id))
+        match = COMMAND.match(body)
         journal_path = _journal_path(env, data.get('session_id'))
         if journal_path and not os.path.exists(journal_path):
             # A session's first prompt: its start, where a runtime has no SessionStart event (refresh is hourly at most).
@@ -302,9 +310,20 @@ def handle(data, env, runtime, http=core.http_json):
                 data['tool_notes'] = marker.get('tool_notes', {})
             if match[1] == 'save':
                 _save_inputs(env, data)
-            output = core.COMMANDS['consolex:' + match[1]](data, env, match[2], http=http)
+            if match[1] == 'start':
+                output, task = core.start_task(data, env, match[2], http=http)
+                if task:
+                    # Starting a task asks for work: keep its request and delivery when saving this session.
+                    _journal_prompt(env, data, prompt, command=False, synthetic=synthetic)
+                    if runtime == 'deepseek_harness':
+                        output['consolexTask'] = {'name': task['name']}
+            else:
+                handler = core._command_handler('consolex:' + match[1], env)
+                output = handler(data, env, match[2], http=http) if handler else core._context(data, (
+                    'ConsoleX: scheduled runs are set up in the Codex app or the Claude desktop app; %s has no scheduler. '
+                    'Tell the user in one line.') % RUNTIMES[runtime])
             return adapt(output, runtime)
-        match = TASK.search(prompt)
+        match = TASK.search(body)
         if match:
             folder = core.find_skill_dir(match[1], env, data.get('cwd') or os.getcwd())
             if folder:
@@ -321,6 +340,9 @@ def handle(data, env, runtime, http=core.http_json):
                 core.save_marker(env, marker)
                 core.heartbeat(data, env, http=http)
         return None
+    if event == 'PostToolUse' and runtime == 'codex' and core.is_codex_schedule_tool(data.get('tool_name')):
+        # The agent created, changed or deleted a Codex app scheduled task: ConsoleX hears it at once.
+        return adapt(core.on_codex_schedule_changed(data, env, http=http), runtime)
     if event == 'PostToolUse':
         output = _activate_from_tool(data, env, http)
         marker = core.load_marker(env, data.get('session_id'))
