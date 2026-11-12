@@ -36,7 +36,7 @@ def mcp_config(text, script):
     block = '\n'.join([MCP_BEGIN, '[mcp_servers.consolex]', 'command = "python3"', 'args = [%s]' % _toml_string(script),
                        'env = { CONSOLEX_RUNTIME = "codex" }', 'startup_timeout_sec = 20', 'tool_timeout_sec = 330',
                        # Codex refuses (never prompts) an MCP call that needs approval under "never" (Full access).
-                       # The owner's consent is the computer's "Tools and files" permission in ConsoleX.
+                       # ConsoleX authorizes each call through the task's tool-permission switch.
                        'default_tools_approval_mode = "approve"', MCP_END])
     updated = (text + '\n\n' if text else '') + block + '\n'
     try:

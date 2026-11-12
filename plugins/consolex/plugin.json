@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "consolex",
-  "version": "1.4.3",
+  "version": "1.8.7",
   "description": "Run ConsoleX tasks in Codex and check deliveries in ConsoleX.",
   "author": {
     "name": "ConsoleX"

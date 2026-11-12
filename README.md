@@ -2,12 +2,12 @@
 
 Do your [ConsoleX](https://consolex.ai) tasks in Codex and have every delivery checked against the task's saved acceptance standard before Codex finishes.
 
-A ConsoleX task holds a method (how to do the work) and an acceptance standard (what a good result must meet). This integration adds a task to Codex as a `$cx-…` Skill. When Codex hands over the result, ConsoleX checks it with an independent judge and records the attempt in the task's run history. Codex never sees the acceptance standard, only the method, so the check stays independent. When a check fails or needs review, Codex sees just those items, tells you, and changes nothing until you say so.
+A ConsoleX task holds a method (how to do the work) and an acceptance standard (what a good result must meet). This integration adds a task to Codex as a `$cx-…` Skill. When Codex hands over the result, ConsoleX checks it against the saved standard when automatic checks are enabled and records the attempt in the task's run history. Codex never sees the acceptance standard, only the method. The checker uses a different model family when available, and discloses when it is not independent. When a check fails or needs review, Codex reports the items for your decision; optional automatic revision can retry failed required output checks.
 
 ## Requirements
 
-- Codex CLI. Tested with 0.162.1.
-- `python3` (3.9 or later). The integration uses only the Python standard library; nothing is installed or downloaded.
+- Codex CLI.
+- Git and `python3` (3.9 or later). The integration uses only the Python standard library.
 - A ConsoleX account on a paid plan to connect a computer.
 - Network access to `*.consolex.ai`: the integration calls the API at `api.consolex.ai`, and tasks and Skills can link to files on `static.consolex.ai`, ConsoleX's file CDN.
 
@@ -41,20 +41,19 @@ You can type these commands, or ask Codex in plain words ("add 小语评球 to t
 | `$cx-<task name>` | Starts the task. |
 | `$consolex-check [off]` | Checks the current task's latest delivery now; `off` turns checks off for this session. |
 | `$consolex-save [task name]` | Sends this session to ConsoleX as a task draft that you review and save there. Type it yourself. |
-| `$consolex-logout` | Disconnects this computer. Type it yourself. You can also remove computers in ConsoleX under Settings › Coding agents. |
+| `$consolex-logout [api address \| all]` | Disconnects this computer. Type it yourself. If this computer is connected to more than one ConsoleX address, it lists them and disconnects nothing until you name one or `all`. If ConsoleX cannot be reached the connection is kept so you can retry; add `--local` to forget it on this computer only. You can also remove computers in ConsoleX under Settings › Coding agents. |
 
 Advanced:
 
 | Command | What it does |
 | --- | --- |
-| `$consolex-run <task>` | Prints the terminal command for an isolated run of the task (a new Codex session with only the task's Skills, files and ConsoleX tools). |
 
 When adding a task whose name cannot form a readable Skill name (for example, a Chinese name), Codex gives it a short English Skill name through `consolex_rename_skill`. Later updates keep that name.
 
 ## What the installer changes
 
 - Copies the integration to `~/.consolex/codex-integration`.
-- Adds the ConsoleX hooks to `~/.codex/hooks.json` (`SessionStart`, `UserPromptSubmit`, `PreToolUse` on `request_user_input`, `PostToolUse`, `Stop`, `SessionEnd`, `Interrupt`). Your other hooks are kept, and the file is first backed up to `hooks.before-consolex.json`. Hooks are never trusted for you.
+- Adds the ConsoleX hooks to `~/.codex/hooks.json` (`SessionStart`, `UserPromptSubmit`, `PreToolUse` on `request_user_input` and the tools of the `consolex` MCP server, `PostToolUse`, `Stop`, `SessionEnd`, `Interrupt`). Your other hooks are kept, and the file is first backed up to `hooks.before-consolex.json`. Hooks are never trusted for you.
 - Adds a marked block to `~/.codex/config.toml` that registers the MCP server `consolex` (backed up first to `config.before-consolex.toml`). It is pre-approved because Codex refuses, without asking, an MCP call that needs approval under Full access; your consent is the computer's "Tools and files" permission in ConsoleX. It refuses to install if `config.toml` already defines an MCP server named `consolex`.
 - Installs the `consolex-…` command Skills in `~/.agents/skills`. It never replaces a Skill it did not install.
 
@@ -72,11 +71,11 @@ Everything runs locally with your user permissions.
 
 **Hooks.** When you start a task with `$cx-…` or `$consolex-start`, the hooks mark the session, fetch the task's latest approved method and tell ConsoleX a session started. While that session works they collect its tool calls, tell ConsoleX when a question to you is open, submit a reply that has a "ConsoleX delivery" section for checking, and show the result. In any other session they exit without a network call, except a background refresh of your installed task Skills at session start, at most once an hour.
 
-**MCP server.** `consolex` gives Codex `consolex_task_tools` and `consolex_run_task_tool` to call the tools of your ConsoleX tasks. ConsoleX runs each call with your connections, records it and bills it like a run in ConsoleX. This needs the "Tools and files" permission for the computer in ConsoleX.
+**MCP server.** `consolex` gives Codex `consolex_task_tools` and `consolex_run_task_tool` to call the tools of your ConsoleX tasks. ConsoleX runs each call with your connections, records it and bills it like a run in ConsoleX. For a task whose method is stored in ConsoleX, this needs the task’s coding-agent tool permission in its run panel.
 
 `consolex_rename_skill` renames an added task Skill locally. `consolex_command` runs login, status, tasks, add, remove or run when you ask for one in plain words; it never logs out or saves a session.
 
-**Isolated runs.** `$consolex-run` only prints a command. When you run that command (`~/.consolex/bin/consolex-codex run '<task>'`) in a terminal, it creates `~/ConsoleX/<task>/` with the task's Skills and files, and starts Codex there with its own Codex home (your Codex sign-in linked, ConsoleX hooks trusted, only the ConsoleX MCP server) and an empty home folder, so none of your own Skills, plugins, MCP servers, memories or `AGENTS.md` load. It changes nothing in your own Codex settings.
+**Isolated runs.** No command offers an isolated run while ConsoleX validates the product. When you run `~/.consolex/bin/consolex-codex run '<task>'` in a terminal, it creates `~/ConsoleX/<task>/` with the task's Skills and files, and starts Codex there with its own Codex home (your Codex sign-in linked, ConsoleX hooks trusted, only the ConsoleX MCP server) and an empty home folder, so none of your own Skills, plugins, MCP servers, memories or `AGENTS.md` load. It changes nothing in your own Codex settings.
 
 **Stored on your computer.**
 
@@ -120,3 +119,7 @@ Everything runs locally with your user permissions.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Stage checks
+
+Staged checks are an optional preview available only to enabled accounts with a paid plan. When a task has stages enabled, Codex submits intermediate text and reads each verdict; a stage that does not pass is reported and the task continues. Stage checks for new runs do not block tool calls. The former speech-generation gate is paused for new runs; runs already admitted under it keep their original behavior. Final delivery checks remain separate.

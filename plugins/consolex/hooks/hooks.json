@@ -28,10 +28,10 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/consolex.py\"",
-            "timeout": 200
+            "timeout": 10
           }
         ],
-        "matcher": "request_user_input"
+        "matcher": "^(?:request_user_input(?:_async)?|mcp__consolex__.*)$"
       }
     ],
     "PostToolUse": [
